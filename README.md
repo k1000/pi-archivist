@@ -70,3 +70,4 @@ The bootstrap pass should scan important documentation roots, relevant commit hi
 ## Git hook
 
 The post-commit hook runs `bin/archivist-hook.mjs` asynchronously and logs to `.git/archivist.log`. It is conservative: it writes Obsidian evidence/journal notes and updates `catalog.csv`; repo-local docs follow-up is recorded in Obsidian `inbox`.
+
