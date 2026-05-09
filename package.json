@@ -1,0 +1,21 @@
+{
+  "name": "pi-archivist",
+  "version": "0.1.0",
+  "description": "A Pi extension for durable write-side project memory, documentation maintenance, commit ingestion, and taxonomy-aware knowledge management.",
+  "type": "module",
+  "license": "MIT",
+  "author": "k1000",
+  "keywords": ["pi-package", "pi-coding-agent", "pi-extension", "documentation", "memory", "archivist", "taxonomy"],
+  "repository": { "type": "git", "url": "git+https://github.com/k1000/pi-archivist.git" },
+  "bugs": { "url": "https://github.com/k1000/pi-archivist/issues" },
+  "homepage": "https://github.com/k1000/pi-archivist#readme",
+  "peerDependencies": {
+    "@mariozechner/pi-ai": "*",
+    "@mariozechner/pi-coding-agent": "*",
+    "typebox": "*"
+  },
+  "pi": {
+    "extensions": ["./index.ts"],
+    "skills": ["./skills"]
+  }
+}
