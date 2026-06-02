@@ -155,17 +155,18 @@ async function callAnthropicProvider(provider, target, prompt, userContent, apiK
   if (!res.ok) return { ok: false, reason: `${provider.api} ${res.status}: ${(await res.text()).slice(0, 240)}` };
   const text = anthropicText(await res.json());
   if (!text) return { ok: false, reason: `${provider.api} returned no text content` };
-  return { ok: true, text };
+  return { ok: true, text, api: provider.api };
 }
 
 async function callOpenAiProvider(provider, target, prompt, userContent, apiKeyValue) {
+  const api = provider.api || "openai";
   const url = provider.baseUrl.replace(/\/$/, "") + "/chat/completions";
   const body = { model: target.id, messages: [{ role: "system", content: prompt }, { role: "user", content: userContent }], temperature: 0.2, max_tokens: 2048 };
   const res = await fetch(url, { method: "POST", headers: { "content-type": "application/json", authorization: `Bearer ${apiKeyValue || "1234"}` }, body: JSON.stringify(body), signal: AbortSignal.timeout(30000) });
-  if (!res.ok) return { ok: false, reason: `${provider.api || "openai"} ${res.status}: ${(await res.text()).slice(0, 240)}` };
+  if (!res.ok) return { ok: false, reason: `${api} ${res.status}: ${(await res.text()).slice(0, 240)}` };
   const text = normalizeModelMarkdown((await res.json())?.choices?.[0]?.message?.content ?? "");
-  if (!text) return { ok: false, reason: `${provider.api || "openai"} returned no text content` };
-  return { ok: true, text };
+  if (!text) return { ok: false, reason: `${api} returned no text content` };
+  return { ok: true, text, api };
 }
 
 async function callModelProvider(target, prompt, userContent) {
@@ -362,13 +363,11 @@ function printReliabilityStatus(cfg, repo, limit = 100) {
 }
 
 async function smokeModel(cfg) {
-  lastModelFallbackReason = "";
   const target = { provider: cfg.model.provider, id: cfg.model.id };
   const result = await callModelProvider(target, "", "Reply with exactly: ARCHIVIST_MODEL_OK");
   if (!result.ok) throw new Error(result.reason);
   if (!result.text.includes("ARCHIVIST_MODEL_OK")) throw new Error(`unexpected model response: ${result.text.slice(0, 160)}`);
-  const provider = await providerConfig(cfg.model.provider);
-  return { ok: true, api: provider?.api || "openai", model: `${cfg.model.provider}/${cfg.model.id}`, text: result.text };
+  return { ok: true, api: result.api, model: `${cfg.model.provider}/${cfg.model.id}` };
 }
 function printHelp() {
   console.log([
