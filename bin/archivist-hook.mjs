@@ -363,34 +363,12 @@ function printReliabilityStatus(cfg, repo, limit = 100) {
 
 async function smokeModel(cfg) {
   lastModelFallbackReason = "";
+  const target = { provider: cfg.model.provider, id: cfg.model.id };
+  const result = await callModelProvider(target, "", "Reply with exactly: ARCHIVIST_MODEL_OK");
+  if (!result.ok) throw new Error(result.reason);
+  if (!result.text.includes("ARCHIVIST_MODEL_OK")) throw new Error(`unexpected model response: ${result.text.slice(0, 160)}`);
   const provider = await providerConfig(cfg.model.provider);
-  if (!provider?.baseUrl) throw new Error(`provider not found or missing baseUrl: ${cfg.model.provider}`);
-  const apiKeyValue = provider.apiKey && process.env[provider.apiKey] ? process.env[provider.apiKey] : provider.apiKey;
-  if (!apiKeyValue && !provider.baseUrl.includes("127.0.0.1") && !provider.baseUrl.includes("localhost")) throw new Error(`missing API key for provider: ${cfg.model.provider}`);
-  const prompt = "Reply with exactly: ARCHIVIST_MODEL_OK";
-  if (provider.api === "anthropic-messages") {
-    const res = await fetch(`${provider.baseUrl.replace(/\/$/, "")}/v1/messages`, {
-      method: "POST",
-      headers: { "content-type": "application/json", "x-api-key": apiKeyValue || "1234", "anthropic-version": "2023-06-01" },
-      body: JSON.stringify({ model: cfg.model.id, messages: [{ role: "user", content: prompt }], max_tokens: 512 }),
-      signal: AbortSignal.timeout(30000),
-    });
-    if (!res.ok) throw new Error(`${provider.api} ${res.status}: ${(await res.text()).slice(0, 240)}`);
-    const text = anthropicText(await res.json());
-    if (!text.includes("ARCHIVIST_MODEL_OK")) throw new Error(`unexpected model response: ${text.slice(0, 160)}`);
-    return { ok: true, api: provider.api, model: `${cfg.model.provider}/${cfg.model.id}`, text };
-  }
-  const res = await fetch(`${provider.baseUrl.replace(/\/$/, "")}/chat/completions`, {
-    method: "POST",
-    headers: { "content-type": "application/json", authorization: `Bearer ${apiKeyValue || "1234"}` },
-    body: JSON.stringify({ model: cfg.model.id, messages: [{ role: "user", content: prompt }], max_tokens: 512 }),
-    signal: AbortSignal.timeout(30000),
-  });
-  if (!res.ok) throw new Error(`${provider.api || "openai"} ${res.status}: ${(await res.text()).slice(0, 240)}`);
-  const json = await res.json();
-  const text = normalizeModelMarkdown(json?.choices?.[0]?.message?.content ?? "");
-  if (!text.includes("ARCHIVIST_MODEL_OK")) throw new Error(`unexpected model response: ${text.slice(0, 160)}`);
-  return { ok: true, api: provider.api || "openai", model: `${cfg.model.provider}/${cfg.model.id}`, text };
+  return { ok: true, api: provider?.api || "openai", model: `${cfg.model.provider}/${cfg.model.id}`, text: result.text };
 }
 function printHelp() {
   console.log([
