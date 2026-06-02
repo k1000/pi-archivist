@@ -711,22 +711,17 @@ function safeExistingDocCandidates(cwd: string, candidates: string[] = []): stri
     .filter((candidate): candidate is string => !!candidate && existsSync(path.join(cwd, candidate))))];
 }
 
-async function modelDocumentationMaintenance(runtime: DocumentationModelRuntime, cfg: ArchivistConfig, cwd: string, audit: { changedSources?: string[]; candidates?: string[] }): Promise<DocumentationMaintenanceResult> {
-  if (cfg.model.heuristicOnly) return { decision: "handoff", summary: "Archivist model is configured as heuristic-only.", handoff: documentationAuditMessage(audit) };
+async function documentationMaintenanceModelAuth(runtime: DocumentationModelRuntime, cfg: ArchivistConfig, audit: { changedSources?: string[]; candidates?: string[] }) {
+  if (cfg.model.heuristicOnly) return { error: { decision: "handoff" as const, summary: "Archivist model is configured as heuristic-only.", handoff: documentationAuditMessage(audit) } };
   const model = runtime.modelRegistry.find(cfg.model.provider, cfg.model.id);
-  if (!model) return { decision: "handoff", summary: `Archivist model not found: ${cfg.model.provider}/${cfg.model.id}`, handoff: documentationAuditMessage(audit) };
+  if (!model) return { error: { decision: "handoff" as const, summary: `Archivist model not found: ${cfg.model.provider}/${cfg.model.id}`, handoff: documentationAuditMessage(audit) } };
   const auth = await runtime.modelRegistry.getApiKeyAndHeaders(model);
-  if (!auth.ok || !auth.apiKey) return { decision: "handoff", summary: auth.ok ? `No API key for ${model.provider}` : auth.error, handoff: documentationAuditMessage(audit) };
+  if (!auth.ok || !auth.apiKey) return { error: { decision: "handoff" as const, summary: auth.ok ? `No API key for ${model.provider}` : auth.error, handoff: documentationAuditMessage(audit) } };
+  return { model, auth };
+}
 
-  const changedSources = audit.changedSources ?? [];
-  const candidates = safeExistingDocCandidates(cwd, audit.candidates).slice(0, 8);
-  const diff = await git(cwd, ["diff", "--", ...changedSources]).catch(() => "");
-  const docs = candidates.map((file) => {
-    const text = readFileSync(path.join(cwd, file), "utf8");
-    return `--- DOC ${file} ---\n${text.slice(0, 18000)}`;
-  }).join("\n\n");
-
-  const prompt = [
+function documentationMaintenancePrompt() {
+  return [
     "You are Archivist, Sherpa's write-side documentation maintenance agent.",
     "Use the dedicated Archivist model only; do not delegate repo documentation decisions to the main coding agent.",
     "Decide whether the changed source/config files require repo-local documentation updates.",
@@ -737,7 +732,19 @@ async function modelDocumentationMaintenance(runtime: DocumentationModelRuntime,
     '{ "decision": "updated|no_update|handoff", "summary": "...", "updates": [{ "path": "docs/file.md", "oldText": "exact existing text", "newText": "replacement text", "reason": "..." }], "handoff": "optional markdown" }',
     "Rules: update only files included in Candidate docs; oldText must be copied exactly from provided doc content; keep changes minimal and factual; escape newlines inside JSON strings as \\n.",
   ].join("\n");
-  const message: UserMessage = {
+}
+
+function documentationMaintenanceRepairPrompt() {
+  return [
+    "You repair invalid JSON for Archivist documentation maintenance.",
+    "Return ONLY strict valid JSON matching this shape:",
+    '{ "decision": "updated|no_update|handoff", "summary": "...", "updates": [{ "path": "docs/file.md", "oldText": "exact existing text", "newText": "replacement text", "reason": "..." }], "handoff": "optional markdown" }',
+    "Do not add markdown fences or commentary. Escape newlines inside JSON strings as \\n. If the previous output cannot be safely repaired, return a handoff decision with a brief summary.",
+  ].join("\n");
+}
+
+function documentationMaintenanceMessage(changedSources: string[], candidates: string[], diff: string, docs: string): UserMessage {
+  return {
     role: "user",
     timestamp: Date.now(),
     content: [{ type: "text", text: [
@@ -747,30 +754,42 @@ async function modelDocumentationMaintenance(runtime: DocumentationModelRuntime,
       `Current candidate doc excerpts:\n${docs || "(none)"}`,
     ].join("\n\n") }],
   };
-  const response = await complete(model, { systemPrompt: prompt, messages: [message] }, { apiKey: auth.apiKey, headers: auth.headers, signal: runtime.signal });
-  if (response.stopReason === "aborted") return { decision: "handoff", summary: "Archivist model call aborted.", handoff: documentationAuditMessage(audit) };
-  const text = response.content.filter((c): c is { type: "text"; text: string } => c.type === "text").map(c => c.text).join("\n").trim();
-  const parsed = extractJsonObject(text) as DocumentationMaintenanceResult | undefined;
-  if (parsed) return parsed;
+}
 
-  const repairPrompt = [
-    "You repair invalid JSON for Archivist documentation maintenance.",
-    "Return ONLY strict valid JSON matching this shape:",
-    '{ "decision": "updated|no_update|handoff", "summary": "...", "updates": [{ "path": "docs/file.md", "oldText": "exact existing text", "newText": "replacement text", "reason": "..." }], "handoff": "optional markdown" }',
-    "Do not add markdown fences or commentary. Escape newlines inside JSON strings as \\n. If the previous output cannot be safely repaired, return a handoff decision with a brief summary.",
-  ].join("\n");
+function textFromModelResponse(response: Awaited<ReturnType<typeof complete>>) {
+  return response.content.filter((c): c is { type: "text"; text: string } => c.type === "text").map(c => c.text).join("\n").trim();
+}
+
+async function repairDocumentationMaintenanceJson(runtime: DocumentationModelRuntime, auth: { apiKey: string; headers?: Record<string, string> }, model: any, text: string) {
   const repairMessage: UserMessage = {
     role: "user",
     timestamp: Date.now(),
     content: [{ type: "text", text: `Previous invalid output:\n${text.slice(0, 8000)}` }],
   };
-  const repair = await complete(model, { systemPrompt: repairPrompt, messages: [repairMessage] }, { apiKey: auth.apiKey, headers: auth.headers, signal: runtime.signal });
-  if (repair.stopReason !== "aborted") {
-    const repairedText = repair.content.filter((c): c is { type: "text"; text: string } => c.type === "text").map(c => c.text).join("\n").trim();
-    const repaired = extractJsonObject(repairedText) as DocumentationMaintenanceResult | undefined;
-    if (repaired) return { ...repaired, summary: repaired.summary ? `${repaired.summary} (JSON repaired after invalid first response.)` : "JSON repaired after invalid first response." };
-  }
+  const repair = await complete(model, { systemPrompt: documentationMaintenanceRepairPrompt(), messages: [repairMessage] }, { apiKey: auth.apiKey, headers: auth.headers, signal: runtime.signal });
+  if (repair.stopReason === "aborted") return undefined;
+  const repairedText = textFromModelResponse(repair);
+  const repaired = extractJsonObject(repairedText) as DocumentationMaintenanceResult | undefined;
+  return repaired ? { ...repaired, summary: repaired.summary ? `${repaired.summary} (JSON repaired after invalid first response.)` : "JSON repaired after invalid first response." } : undefined;
+}
 
+async function modelDocumentationMaintenance(runtime: DocumentationModelRuntime, cfg: ArchivistConfig, cwd: string, audit: { changedSources?: string[]; candidates?: string[] }): Promise<DocumentationMaintenanceResult> {
+  const ready = await documentationMaintenanceModelAuth(runtime, cfg, audit);
+  if (ready.error) return ready.error;
+
+  const changedSources = audit.changedSources ?? [];
+  const candidates = safeExistingDocCandidates(cwd, audit.candidates).slice(0, 8);
+  const diff = await git(cwd, ["diff", "--", ...changedSources]).catch(() => "");
+  const docs = candidates.map((file) => `--- DOC ${file} ---\n${readFileSync(path.join(cwd, file), "utf8").slice(0, 18000)}`).join("\n\n");
+  const message = documentationMaintenanceMessage(changedSources, candidates, diff, docs);
+  const response = await complete(ready.model, { systemPrompt: documentationMaintenancePrompt(), messages: [message] }, { apiKey: ready.auth.apiKey, headers: ready.auth.headers, signal: runtime.signal });
+  if (response.stopReason === "aborted") return { decision: "handoff", summary: "Archivist model call aborted.", handoff: documentationAuditMessage(audit) };
+
+  const text = textFromModelResponse(response);
+  const parsed = extractJsonObject(text) as DocumentationMaintenanceResult | undefined;
+  if (parsed) return parsed;
+  const repaired = await repairDocumentationMaintenanceJson(runtime, ready.auth, ready.model, text);
+  if (repaired) return repaired;
   return { decision: "handoff", summary: "Archivist model returned unparsable documentation maintenance output after one repair attempt.", handoff: `${documentationAuditMessage(audit)}\n\nRaw model output:\n\n${text.slice(0, 4000)}` };
 }
 
