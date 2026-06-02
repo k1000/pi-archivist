@@ -1256,71 +1256,95 @@ function researchAreaFromPath(file: string) {
   return idx >= 0 ? parts[idx + 1] : undefined;
 }
 
-async function mirrorSourceDocumentToMemoryApi(cfg: ArchivistConfig, cwd: string, file: string) {
-  const store = archivistMemoryStore(cfg);
-  if (!store) return { mirrored: false, reason: "memory API disabled" };
-  const resolved = path.isAbsolute(file) ? file : path.resolve(cwd, file);
-  if (!existsSync(resolved) || !statSync(resolved).isFile()) return { mirrored: false, reason: `Source file not found: ${file}` };
-  const raw = readFileSync(resolved, "utf8");
-  const now = nowIso();
+function sourceDocumentContext(cwd: string, resolved: string, raw: string, now: string) {
   const area = researchAreaFromPath(resolved);
   const scope = area ? "research" as const : "project" as const;
   const project = scope === "project" ? path.basename(cwd) : undefined;
   const rel = path.relative(cwd, resolved).replace(/\\/g, "/");
-  const artifactId = stableMemoryId("source", resolved);
   const title = titleFromMarkdown(raw, path.basename(resolved));
-  const artifact: MemoryArtifact = {
-    id: artifactId,
+  return {
+    area,
     scope,
     project,
-    area,
-    category: area === "ai" ? "agent-memory" : undefined,
-    type: "source",
+    rel,
     title,
-    summary: `Source document mirrored by Archivist: ${title}`,
-    text: raw.slice(0, 24000),
+    artifactId: stableMemoryId("source", resolved),
     sourcePath: rel.startsWith("..") ? resolved : rel,
     sourceHash: createHash("sha256").update(raw).digest("hex"),
+    now,
+  };
+}
+
+function sourceDocumentArtifact(ctx: ReturnType<typeof sourceDocumentContext>, raw: string): MemoryArtifact {
+  return {
+    id: ctx.artifactId,
+    scope: ctx.scope,
+    project: ctx.project,
+    area: ctx.area,
+    category: ctx.area === "ai" ? "agent-memory" : undefined,
+    type: "source",
+    title: ctx.title,
+    summary: `Source document mirrored by Archivist: ${ctx.title}`,
+    text: raw.slice(0, 24000),
+    sourcePath: ctx.sourcePath,
+    sourceHash: ctx.sourceHash,
     confidence: "medium",
     status: "active",
-    tags: ["archivist", "source", area ?? "project"],
-    aliases: [title, path.basename(resolved)],
-    routes: [title, path.basename(resolved)],
-    keywords: [title, path.basename(resolved), ...(area ? [area] : [])],
-    createdAt: now,
-    updatedAt: now,
+    tags: ["archivist", "source", ctx.area ?? "project"],
+    aliases: [ctx.title, path.basename(ctx.sourcePath)],
+    routes: [ctx.title, path.basename(ctx.sourcePath)],
+    keywords: [ctx.title, path.basename(ctx.sourcePath), ...(ctx.area ? [ctx.area] : [])],
+    createdAt: ctx.now,
+    updatedAt: ctx.now,
   };
-  await store.writeArtifact(artifact);
-  const chunkStats = await writeDocumentChunks(store, cfg, artifact, raw);
-  await writeEntityMentions(store, project ?? path.basename(cwd), artifactId, raw.slice(0, 12000), resolved, now);
+}
+
+async function writeSourceDocumentClaims(store: ReturnType<typeof archivistMemoryStore>, cwd: string, resolved: string, raw: string, ctx: ReturnType<typeof sourceDocumentContext>) {
+  if (!store) return 0;
   let claims = 0;
   for (const claim of extractSourceGroundedClaims(raw).slice(0, 12)) {
     const claimId = stableMemoryId("claim", `${resolved}\n${claim}`);
     await store.writeArtifact({
       id: claimId,
-      scope,
-      project,
-      area,
-      category: area === "ai" ? "agent-memory" : undefined,
+      scope: ctx.scope,
+      project: ctx.project,
+      area: ctx.area,
+      category: ctx.area === "ai" ? "agent-memory" : undefined,
       type: "claim",
       title: claim.slice(0, 100),
       summary: claim,
       text: claim,
-      sourcePath: rel.startsWith("..") ? resolved : rel,
-      sourceHash: createHash("sha256").update(raw).digest("hex"),
+      sourcePath: ctx.sourcePath,
+      sourceHash: ctx.sourceHash,
       confidence: "medium",
       status: "active",
-      tags: ["claim", "archivist", area ?? "project"],
+      tags: ["claim", "archivist", ctx.area ?? "project"],
       aliases: [claim.slice(0, 80)],
       keywords: claim.split(/\W+/).filter((word) => word.length > 4).slice(0, 16),
-      createdAt: now,
-      updatedAt: now,
+      createdAt: ctx.now,
+      updatedAt: ctx.now,
     }).catch(() => undefined);
-    await store.writeRelation({ from: artifactId, relation: "supports", to: claimId, confidence: "medium", source: resolved, createdAt: now }).catch(() => undefined);
-    await writeEntityMentions(store, project ?? path.basename(cwd), claimId, claim, resolved, now);
+    await store.writeRelation({ from: ctx.artifactId, relation: "supports", to: claimId, confidence: "medium", source: resolved, createdAt: ctx.now }).catch(() => undefined);
+    await writeEntityMentions(store, ctx.project ?? path.basename(cwd), claimId, claim, resolved, ctx.now);
     claims++;
   }
-  return { mirrored: true, artifactId, title, claims, ...chunkStats };
+  return claims;
+}
+
+async function mirrorSourceDocumentToMemoryApi(cfg: ArchivistConfig, cwd: string, file: string) {
+  const store = archivistMemoryStore(cfg);
+  if (!store) return { mirrored: false, reason: "memory API disabled" };
+  const resolved = path.isAbsolute(file) ? file : path.resolve(cwd, file);
+  if (!existsSync(resolved) || !statSync(resolved).isFile()) return { mirrored: false, reason: `Source file not found: ${file}` };
+
+  const raw = readFileSync(resolved, "utf8");
+  const ctx = sourceDocumentContext(cwd, resolved, raw, nowIso());
+  const artifact = sourceDocumentArtifact(ctx, raw);
+  await store.writeArtifact(artifact);
+  const chunkStats = await writeDocumentChunks(store, cfg, artifact, raw);
+  await writeEntityMentions(store, ctx.project ?? path.basename(cwd), ctx.artifactId, raw.slice(0, 12000), resolved, ctx.now);
+  const claims = await writeSourceDocumentClaims(store, cwd, resolved, raw, ctx);
+  return { mirrored: true, artifactId: ctx.artifactId, title: ctx.title, claims, ...chunkStats };
 }
 
 async function mirrorCommitEvidenceToMemoryApi(cfg: ArchivistConfig, cwd: string, written: NonNullable<ReturnType<typeof writeMemory>>, commit: string, files: string[]) {
