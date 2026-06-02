@@ -1,0 +1,3 @@
+{
+  "entry": ["index.ts", "bin/archivist-hook.mjs", "scripts/check-extension.ts", "tests/**/*.ts"]
+}

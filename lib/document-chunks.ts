@@ -1,4 +1,4 @@
-export type ChunkArtifact = {
+type ChunkArtifact = {
   id: string;
   scope: "project" | "research" | "transcendental";
   project?: string;
@@ -7,7 +7,7 @@ export type ChunkArtifact = {
   sourcePath?: string;
 };
 
-export type PreparedDocumentChunk = {
+type PreparedDocumentChunk = {
   id: string;
   artifactId: string;
   scope: ChunkArtifact["scope"];
@@ -20,7 +20,7 @@ export type PreparedDocumentChunk = {
   sourcePath?: string;
 };
 
-export type PreparedChunkRelation = {
+type PreparedChunkRelation = {
   from: string;
   relation: "has_chunk";
   to: string;
@@ -30,7 +30,7 @@ export type PreparedChunkRelation = {
   createdAt?: string;
 };
 
-export type PreparedDocumentChunks = {
+type PreparedDocumentChunks = {
   chunks: PreparedDocumentChunk[];
   relations: PreparedChunkRelation[];
 };

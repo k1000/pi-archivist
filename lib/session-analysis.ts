@@ -3,7 +3,7 @@ import type { ExtensionContext } from "@mariozechner/pi-coding-agent";
 import { appendFileSync, mkdirSync } from "node:fs";
 import path from "node:path";
 
-export type SessionAnalysisConfig = {
+type SessionAnalysisConfig = {
   model: {
     provider: string;
     id: string;
