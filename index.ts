@@ -480,6 +480,83 @@ function recordDocDriftAudit(cwd: string, fingerprint: string, result: string) {
  * findDocumentationCandidates) with the Archivist model reading the
  * actual changed files and diffs to decide if documentation needs updating.
  */
+function documentationAuditFingerprint(files: string[], diff: string) {
+  const sortedFiles = [...files].sort();
+  return createHash("sha256").update(`${sortedFiles.join("\n")}\n---diff---\n${diff}`).digest("hex");
+}
+
+function rememberDocAuditHash(state: ArchivistState, hash: string) {
+  state.autoMemory.docAuditHashes = [...state.autoMemory.docAuditHashes.slice(-49), hash];
+}
+
+function documentationAuditPrompt() {
+  return [
+    "You are Archivist, a documentation maintenance agent.",
+    "Analyze the changed files and their diffs. Decide if repo-local documentation needs updating.",
+    "",
+    "Return ONLY JSON in this exact shape:",
+    '{"needsUpdate": true|false, "reason": "brief explanation", "candidateDocs": ["relative/path/to/doc.md"] }',
+    "",
+    "Rules:",
+    "- needsUpdate=true when code/config changes alter behavior, API, usage, or architecture that is documented",
+    "- needsUpdate=false when changes are internal-only, tests, formatting, or clearly don't affect user-facing docs",
+    "- candidateDocs should list documentation files that likely need review (max 5); use repo-relative paths only, never absolute paths or ../ traversal",
+    "- If no docs exist yet and behavior changed significantly, set needsUpdate=true with empty candidateDocs",
+  ].join("\n");
+}
+
+function documentationAuditSnippets(cwd: string) {
+  const docSnippets: string[] = [];
+  for (const rel of ["README.md", "AGENTS.md", "CHANGELOG.md", "docs/README.md"]) {
+    const p = path.join(cwd, rel);
+    if (existsSync(p)) docSnippets.push(`--- ${rel} ---\n${readFileSync(p, "utf8").slice(0, 4000)}`);
+  }
+  if (!existsSync(path.join(cwd, "docs"))) return docSnippets;
+  for (const name of readdirSync(path.join(cwd, "docs")).slice(0, 30)) {
+    if (!/\.(md|mdx|rst)$/i.test(name)) continue;
+    const p = path.join(cwd, "docs", name);
+    docSnippets.push(`--- docs/${name} ---\n${readFileSync(p, "utf8").slice(0, 3000)}`);
+  }
+  return docSnippets;
+}
+
+function parseDocumentationAuditResponse(text: string) {
+  const start = text.indexOf("{");
+  const end = text.lastIndexOf("}");
+  if (start < 0 || end <= start) return undefined;
+  try { return JSON.parse(text.slice(start, end + 1)) as { needsUpdate?: boolean; reason?: string; candidateDocs?: string[] }; }
+  catch { return undefined; }
+}
+
+async function modelDocumentationDriftDecision(
+  cfg: ArchivistConfig,
+  cwd: string,
+  runtime: { modelRegistry: ExtensionContext["modelRegistry"]; signal: AbortSignal },
+  files: string[],
+) {
+  if (cfg.model.heuristicOnly) return undefined;
+  const model = runtime.modelRegistry.find(cfg.model.provider, cfg.model.id);
+  if (!model) return undefined;
+  const auth = await runtime.modelRegistry.getApiKeyAndHeaders(model);
+  if (!auth.ok || !auth.apiKey) return undefined;
+
+  const diff = await git(cwd, ["diff", "--", ...files]).catch(() => "");
+  const docSnippets = documentationAuditSnippets(cwd);
+  const message: UserMessage = {
+    role: "user",
+    timestamp: Date.now(),
+    content: [{ type: "text", text: [
+      `Changed files:\n${files.join("\n")}`,
+      `\nDiff excerpt:\n${diff.slice(0, 20000)}`,
+      docSnippets.length ? `\nExisting docs:\n${docSnippets.join("\n\n")}` : "\nNo existing documentation found.",
+    ].join("\n\n") }],
+  };
+  const response = await complete(model, { systemPrompt: documentationAuditPrompt(), messages: [message] }, { apiKey: auth.apiKey, headers: auth.headers, signal: runtime.signal });
+  if (response.stopReason === "aborted") return undefined;
+  const text = response.content.filter((c): c is { type: "text"; text: string } => c.type === "text").map(c => c.text).join("\n").trim();
+  return parseDocumentationAuditResponse(text);
+}
+
 async function auditDocumentationDrift(
   state: ArchivistState,
   cfg: ArchivistConfig,
@@ -490,84 +567,22 @@ async function auditDocumentationDrift(
   const files = changedFilesOverride ?? await gitChangedFiles(cwd);
   if (!files.length) return { needed: false, reason: "no changes" };
 
-  const sortedFiles = [...files].sort();
-  const fingerprintDiff = await git(cwd, ["diff", "--", ...sortedFiles]).catch(() => "");
-  const persistentFingerprint = createHash("sha256").update(`${sortedFiles.join("\n")}\n---diff---\n${fingerprintDiff}`).digest("hex");
+  const fingerprintDiff = await git(cwd, ["diff", "--", ...[...files].sort()]).catch(() => "");
+  const persistentFingerprint = documentationAuditFingerprint(files, fingerprintDiff);
   const hash = hashAutoMemory(`archivist-doc-audit\n${persistentFingerprint}`);
   if (state.autoMemory.docAuditHashes.includes(hash)) return { needed: false, reason: "already audited", changedSources: files };
   if (hasSeenDocDriftAudit(cwd, persistentFingerprint)) return { needed: false, reason: "identical documentation drift already evaluated", changedSources: files };
 
-  // Ask the model to assess whether docs need updating.
-  let candidates: string[] = [];
-  if (!cfg.model.heuristicOnly) {
-    const model = runtime.modelRegistry.find(cfg.model.provider, cfg.model.id);
-    if (model) {
-      const auth = await runtime.modelRegistry.getApiKeyAndHeaders(model);
-      if (auth.ok && auth.apiKey) {
-        const diff = await git(cwd, ["diff", "--", ...files]).catch(() => "");
-
-        // Gather existing docs for context
-        const docSnippets: string[] = [];
-        for (const rel of ["README.md", "AGENTS.md", "CHANGELOG.md", "docs/README.md"]) {
-          const p = path.join(cwd, rel);
-          if (existsSync(p)) docSnippets.push(`--- ${rel} ---\n${readFileSync(p, "utf8").slice(0, 4000)}`);
-        }
-        if (existsSync(path.join(cwd, "docs"))) {
-          for (const name of readdirSync(path.join(cwd, "docs")).slice(0, 30)) {
-            if (!/\.(md|mdx|rst)$/i.test(name)) continue;
-            const p = path.join(cwd, "docs", name);
-            docSnippets.push(`--- docs/${name} ---\n${readFileSync(p, "utf8").slice(0, 3000)}`);
-          }
-        }
-
-        const prompt = [
-          "You are Archivist, a documentation maintenance agent.",
-          "Analyze the changed files and their diffs. Decide if repo-local documentation needs updating.",
-          "",
-          "Return ONLY JSON in this exact shape:",
-          '{"needsUpdate": true|false, "reason": "brief explanation", "candidateDocs": ["relative/path/to/doc.md"] }',
-          "",
-          "Rules:",
-          "- needsUpdate=true when code/config changes alter behavior, API, usage, or architecture that is documented",
-          "- needsUpdate=false when changes are internal-only, tests, formatting, or clearly don't affect user-facing docs",
-          "- candidateDocs should list documentation files that likely need review (max 5); use repo-relative paths only, never absolute paths or ../ traversal",
-          "- If no docs exist yet and behavior changed significantly, set needsUpdate=true with empty candidateDocs",
-        ].join("\n");
-
-        const message: UserMessage = {
-          role: "user",
-          timestamp: Date.now(),
-          content: [{ type: "text", text: [
-            `Changed files:\n${files.join("\n")}`,
-            `\nDiff excerpt:\n${diff.slice(0, 20000)}`,
-            docSnippets.length ? `\nExisting docs:\n${docSnippets.join("\n\n")}` : "\nNo existing documentation found.",
-          ].join("\n\n") }],
-        };
-
-        const response = await complete(model, { systemPrompt: prompt, messages: [message] }, { apiKey: auth.apiKey, headers: auth.headers, signal: runtime.signal });
-        if (response.stopReason !== "aborted") {
-          const text = response.content.filter((c): c is { type: "text"; text: string } => c.type === "text").map(c => c.text).join("\n").trim();
-          const start = text.indexOf("{");
-          const end = text.lastIndexOf("}");
-          if (start >= 0 && end > start) {
-            try {
-              const parsed = JSON.parse(text.slice(start, end + 1)) as { needsUpdate?: boolean; reason?: string; candidateDocs?: string[] };
-              if (!parsed.needsUpdate) {
-                state.autoMemory.docAuditHashes = [...state.autoMemory.docAuditHashes.slice(-49), hash];
-                recordDocDriftAudit(cwd, persistentFingerprint, "no_update");
-                return { needed: false, reason: parsed.reason || "model decided no update needed", changedSources: files };
-              }
-              candidates = safeExistingDocCandidates(cwd, parsed.candidateDocs).slice(0, 8);
-            } catch { /* ignore parse failure, fall through to allow */ }
-          }
-        }
-      }
-    }
+  const parsed = await modelDocumentationDriftDecision(cfg, cwd, runtime, files);
+  if (parsed && !parsed.needsUpdate) {
+    rememberDocAuditHash(state, hash);
+    recordDocDriftAudit(cwd, persistentFingerprint, "no_update");
+    return { needed: false, reason: parsed.reason || "model decided no update needed", changedSources: files };
   }
 
-  state.autoMemory.docAuditHashes = [...state.autoMemory.docAuditHashes.slice(-49), hash];
+  rememberDocAuditHash(state, hash);
   recordDocDriftAudit(cwd, persistentFingerprint, "needs_update");
-  return { needed: true, hash, changedSources: files, candidates };
+  return { needed: true, hash, changedSources: files, candidates: safeExistingDocCandidates(cwd, parsed?.candidateDocs).slice(0, 8) };
 }
 function documentationAuditMessage(audit: { changedSources?: string[]; candidates?: string[] }) {
   const sources = audit.changedSources ?? [];
