@@ -862,16 +862,20 @@ function extractGraphifySourcePath(node: any): string | undefined {
   return undefined;
 }
 
-function auditGraphifyOutput(cwd: string, targetArg?: string) {
-  const targetRoot = targetArg?.trim() ? (path.isAbsolute(targetArg.trim()) ? targetArg.trim() : path.join(cwd, targetArg.trim())) : cwd;
-  const outDir = path.join(targetRoot, "graphify-out");
-  const graphPath = path.join(outDir, "graph.json");
-  const reportPath = path.join(outDir, "GRAPH_REPORT.md");
-  if (!existsSync(graphPath)) return { ok: false as const, targetRoot, outDir, graphPath, reportPath, reason: "graphify-out/graph.json not found" };
+function graphifyTargetRoot(cwd: string, targetArg?: string) {
+  const target = targetArg?.trim();
+  if (!target) return cwd;
+  return path.isAbsolute(target) ? target : path.join(cwd, target);
+}
 
-  const graph = JSON.parse(readFileSync(graphPath, "utf8"));
-  const nodes: any[] = Array.isArray(graph?.nodes) ? graph.nodes : Array.isArray(graph) ? graph : [];
-  const edges: any[] = Array.isArray(graph?.edges) ? graph.edges : Array.isArray(graph?.links) ? graph.links : [];
+function graphifyGraphParts(graph: any) {
+  return {
+    nodes: Array.isArray(graph?.nodes) ? graph.nodes : Array.isArray(graph) ? graph : [],
+    edges: Array.isArray(graph?.edges) ? graph.edges : Array.isArray(graph?.links) ? graph.links : [],
+  };
+}
+
+function graphifySourceCounts(cwd: string, targetRoot: string, nodes: any[]) {
   const sourceCounts = new Map<string, number>();
   for (const node of nodes) {
     const source = extractGraphifySourcePath(node);
@@ -880,24 +884,42 @@ function auditGraphifyOutput(cwd: string, targetArg?: string) {
     const rel = normalizeCatalogPathForCompare(path.relative(cwd, abs));
     if (rel && !rel.startsWith("..")) sourceCounts.set(rel, (sourceCounts.get(rel) ?? 0) + 1);
   }
+  return sourceCounts;
+}
 
+function graphifySuggestedDirectoryRows(cwd: string, sourceCounts: Map<string, number>) {
   const dirCounts = new Map<string, number>();
   for (const rel of sourceCounts.keys()) {
     const dir = normalizeCatalogPathForCompare(path.dirname(rel));
     if (dir && dir !== ".") dirCounts.set(dir, (dirCounts.get(dir) ?? 0) + 1);
   }
-
-  const suggestedDirectoryRows = [...dirCounts.entries()]
+  return [...dirCounts.entries()]
     .filter(([dir, count]) => count >= 3 && !catalogCoversPath(cwd, dir))
     .sort((a, b) => b[1] - a[1])
     .slice(0, 12)
     .map(([dir, fileCount]) => ({ dir, fileCount }));
+}
 
-  const hotFiles = [...sourceCounts.entries()]
+function graphifyHotFiles(cwd: string, sourceCounts: Map<string, number>) {
+  return [...sourceCounts.entries()]
     .filter(([rel]) => !catalogCoversPath(cwd, rel) && /(^|\/)(readme|index)\.(md|mdx|txt|rst)$/i.test(rel))
     .sort((a, b) => b[1] - a[1])
     .slice(0, 8)
     .map(([file, nodeCount]) => ({ file, nodeCount }));
+}
+
+function auditGraphifyOutput(cwd: string, targetArg?: string) {
+  const targetRoot = graphifyTargetRoot(cwd, targetArg);
+  const outDir = path.join(targetRoot, "graphify-out");
+  const graphPath = path.join(outDir, "graph.json");
+  const reportPath = path.join(outDir, "GRAPH_REPORT.md");
+  if (!existsSync(graphPath)) return { ok: false as const, targetRoot, outDir, graphPath, reportPath, reason: "graphify-out/graph.json not found" };
+
+  const graph = JSON.parse(readFileSync(graphPath, "utf8"));
+  const { nodes, edges } = graphifyGraphParts(graph);
+  const sourceCounts = graphifySourceCounts(cwd, targetRoot, nodes);
+  const suggestedDirectoryRows = graphifySuggestedDirectoryRows(cwd, sourceCounts);
+  const hotFiles = graphifyHotFiles(cwd, sourceCounts);
 
   return { ok: true as const, targetRoot, outDir, graphPath, reportPath, nodes: nodes.length, edges: edges.length, sourceFiles: sourceCounts.size, suggestedDirectoryRows, hotFiles };
 }
