@@ -9,7 +9,7 @@ Archivist reuses Sherpa configuration where possible:
 
 - model defaults from `.pi/sherpa.config.json` or `~/.pi/sherpa.config.json`
 - memory paths from Sherpa's `memory` config
-- Obsidian directory ontology: `wiki/systems`, `wiki/procedures`, `wiki/decisions`, `wiki/concepts`, `wiki/evidence`, `journal`, `inbox`
+- Obsidian directory ontology: `wiki/systems`, `wiki/procedures`, `wiki/decisions`, `wiki/concepts`, `wiki/evidence`, `journal`, `inbox` — plus `wiki/procedures/user-corrections.md` for user behavior corrections and `wiki/procedures/user-profile.md` for cross-session preferences
 - `catalog.csv` as the catalog service/navigation surface for documentation locations
 
 ## Dedicated model
@@ -52,12 +52,35 @@ When Archivist is installed into an existing project, run a bootstrap pass befor
 
 The bootstrap pass should scan important documentation roots, relevant commit history, and project configuration; create or refresh `catalog.csv`; preserve valid existing rows; and create Obsidian `inbox` follow-ups for unclear or stale documentation. For team-developed projects, commit history is especially important because distributed intent, review decisions, and subsystem ownership are often encoded across related commits rather than in one obvious document.
 
+## Inquirer Memory API mirror
+
+Archivist does not connect to SurrealDB or any local database directly. It writes durable Markdown to Obsidian, then mirrors created or updated notes through the Inquirer Memory API. The API owns its backing database.
+
+Project override: `.pi/archivist.config.json`.
+
+```json
+{
+  "memoryApi": {
+    "enabled": true,
+    "mode": "memory-api",
+    "url": "https://api.enquirer.app",
+    "tokenEnv": "SHERPA_MEMORY_API_TOKEN"
+  }
+}
+```
+
+Older `memoryStore.surreal` config is accepted only as a backward-compatible Memory API endpoint alias.
+
+See `docs/INQUIRER_MEMORY_API.md`.
+
 ## Commands
 
 - `/archivist:install-hook` — install async `.git/hooks/post-commit`
-- `/archivist:status` — show configured model, memory root, and hook state
+- `/archivist:status` — show configured model, memory root, Inquirer Memory API mirror, and hook state
 - `/archivist:sync-reflect` — sync reflect captures into Obsidian memory
 - `/archivist:docs:audit` — audit changed source/config for documentation drift
+- `/archivist:memory:smoke-test` — verify Archivist can write/read through the Inquirer Memory API
+- `/archivist:memory:vector-status` — show Inquirer Memory API vector/index health
 - `/archivist:automations` — list safe project automations
 
 ## Tools

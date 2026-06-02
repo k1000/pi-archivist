@@ -25,12 +25,13 @@ This doctrine defines role boundaries, project-vs-research knowledge scope, memo
 2. Distinguish project-related knowledge from reusable research knowledge before choosing a destination. Research knowledge should use a mostly flat `research/<area>/` layout with strong metadata/tags/relationships instead of forced directory taxonomies; subfolders are allowed for unified sources or research attempts such as books, courses, paper series, campaigns, or chapter-like collections. Use the global machine-readable taxonomy `/Users/kamil/Documents/articles/taxonomy.csv` so projects and research can link bidirectionally with consistent labels and relationship names.
 3. Use the existing catalog service surface, `catalog.csv`, to navigate where documentation lives.
 4. Use Obsidian as the primary system documentation store.
-4. Sherpa keeps the repo-local scratchpad; Archivist writes review queues and candidates to Obsidian `inbox`/`journal`.
-5. Update repo-local documentation only when it already exists and is clearly affected; otherwise create an Obsidian inbox follow-up.
-6. Use a dedicated lower model for Archivist, never the main Pi model.
-7. Treat a commit as evidence, but synthesize intent across nearby commits because individual commits are often atomic.
-8. For team-developed projects, commit scanning is even more important: use merge commits, author context, branch names, changed-file clusters, and nearby commits to reconstruct distributed intent and undocumented decisions in the codebase.
-9. Do not absorb the technical doc writer role. When substantial repo-local prose, API docs, guides, or architecture explanations need to be authored, coordinate with the dedicated technical doc writer skill at `/Users/kamil/Development/_DESERT_BACON/ClearStack/.claude/skills/technical-docs-writer/SKILL.md`; Archivist should decide timing/routing/location and maintain memory/catalog bookkeeping.
+5. Automatically ingest every Archivist-created or Archivist-updated Obsidian Markdown note into Inquirer Memory API. Archivist must never connect to SurrealDB or a local database directly; Inquirer owns the backing database.
+6. Sherpa keeps the repo-local scratchpad; Archivist writes review queues and candidates to Obsidian `inbox`/`journal`.
+7. Update repo-local documentation only when it already exists and is clearly affected; otherwise create an Obsidian inbox follow-up.
+8. Use a dedicated lower model for Archivist, never the main Pi model.
+9. Treat a commit as evidence, but synthesize intent across nearby commits because individual commits are often atomic.
+10. For team-developed projects, commit scanning is even more important: use merge commits, author context, branch names, changed-file clusters, and nearby commits to reconstruct distributed intent and undocumented decisions in the codebase.
+11. Do not absorb the technical doc writer role. When substantial repo-local prose, API docs, guides, or architecture explanations need to be authored, coordinate with the dedicated technical doc writer skill at `/Users/kamil/Development/_DESERT_BACON/ClearStack/.claude/skills/technical-docs-writer/SKILL.md`; Archivist should decide timing/routing/location and maintain memory/catalog bookkeeping.
 
 ## Bootstrap existing projects
 
@@ -43,12 +44,30 @@ Bootstrap should scan important documentation roots, preserve existing catalog r
 ## Commands
 
 ```text
-/archivist:status
-/archivist:install-hook
-/archivist:sync-reflect
-/archivist:docs:audit
-/archivist:automations
+/archivist:status           — Show config and hook status
+/archivist:bootstrap        — Bootstrap project catalog and durable memory structure
+/archivist:install-hook     — Install async git post-commit hook
+/archivist:sync-reflect    — Sync reflect captures into Archivist/Sherpa memory
+/archivist:docs:audit      — Audit whether changed code/config needs documentation updates
+/archivist:docs:trail      — Show recent Archivist documentation job log entries; supports status= and kind= filters
+/archivist:model:smoke-test — Verify Archivist can call its configured dedicated model
+/archivist:reliability:status — Summarize recent Archivist job failures/fallbacks
+/archivist:cluster         — Synthesize recent commits as one evidence cluster
+/archivist:graph:audit     — Use existing graphify-out to suggest catalog improvements
+/archivist:catalog:audit   — Audit the repo-local catalog for broken/duplicate rows
+/archivist:automations     — List safe project automations Archivist can run
 ```
+
+## Memory Routing
+
+Archivist routes knowledge by scope:
+
+- **Project knowledge** (project-specific, bounded to one repo) → `wiki/procedures/` in project Obsidian memory
+- **Research knowledge** (cross-project, reusable) → `research/<domain>/` in the Obsidian research vault
+
+Research domains include: `ai`, `llm`, `agent`, `agents`, `software-engineering`, `trading`, `finance`, `backtesting`, `python`, `typescript`, `git`, `documentation`, `operations`, `testing`, `refactoring`, `architecture`, etc.
+
+Distillation uses the `domain` parameter to decide routing. Set `domain` to a cross-project area to route to research/. Set `targetPath` for explicit placement.
 
 ## Tools
 
@@ -76,6 +95,7 @@ Archivist writes into Sherpa-compatible locations:
 - `journal/<yyyy-mm-dd>.md`
 - `catalog.csv` row for new evidence
 - Obsidian `inbox` item when repo-local docs may need review
+- repo-local `.pi-memory/archivist-documentation-jobs.jsonl` trail for commit ingests, documentation maintenance, distillation, preservation, and bootstrap jobs
 
 ## Configuration
 
@@ -93,6 +113,9 @@ Keep the model dedicated/lower, for example:
     "provider": "minimax",
     "id": "MiniMax-M2.7-highspeed",
     "useMainPiModel": false
+  },
+  "documentationJobs": {
+    "logPath": ".pi-memory/archivist-documentation-jobs.jsonl"
   }
 }
 ```

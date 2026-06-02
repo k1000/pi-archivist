@@ -4,13 +4,21 @@ import { Type, type Static } from "typebox";
 import { execFile } from "node:child_process";
 import { promisify } from "node:util";
 import { existsSync, mkdirSync, readFileSync, writeFileSync, appendFileSync, chmodSync, readdirSync, statSync } from "node:fs";
+import { homedir } from "node:os";
 import path from "node:path";
-import { createAutoMemoryState, hashAutoMemory, stringifyForAutoMemory, writeAutoMemoryArtifact, type AutoMemoryState } from "../pi-sherpa/lib/auto-memory";
-import { classifyTaskOutcome, suggestVerificationCommands } from "../pi-sherpa/lib/lifecycle";
+import { createHash } from "node:crypto";
+import { createAutoMemoryState, hashAutoMemory, stringifyForAutoMemory, type AutoMemoryState } from "../pi-sherpa/lib/auto-memory";
+import { modelSessionAnalysis, writeSessionFindings } from "./lib/session-analysis";
+import { prepareDocumentChunks, requestEmbeddings, splitTextChunks } from "./lib/document-chunks";
+import { parseGitStatusFiles, parseReflectSyncArgs } from "../pi-sherpa/lib/common";
+
 import { createAutomationState, discoverRunnableAutomations, findRunnableAutomation, formatRunnableAutomation, recordAutomationRun, updateAutomationCandidates, type AutomationState } from "../pi-sherpa/lib/automation";
 import { evaluatePersistence } from "../pi-sherpa/lib/preserve";
 import { syncReflectMemory } from "../pi-sherpa/lib/memory";
 import { writeDistilledSkill } from "../pi-sherpa/lib/distillation";
+import { auditCatalog, catalogMatches, readProjectCatalog, resolveCatalogPath, upsertCatalogRow } from "../pi-sherpa/lib/catalog";
+import type { CatalogRow } from "../pi-sherpa/lib/catalog";
+import { MemoryApiStore, type MemoryArtifact, type RetrievalFeedbackRecord } from "../pi-sherpa/lib/memory-store";
 
 const execFileAsync = promisify(execFile);
 const TECH_DOC_WRITER_SKILL_PATH = "/Users/kamil/Development/_DESERT_BACON/ClearStack/.claude/skills/technical-docs-writer/SKILL.md";
@@ -31,9 +39,47 @@ const DEFAULT_ARCHIVIST_CONFIG = {
     scratchpadPath: ".pi-memory/scratchpad",
   },
   repoDocs: { mode: "propose" },
+  documentationJobs: {
+    logPath: ".pi-memory/archivist-documentation-jobs.jsonl",
+  },
+  researchLinks: {
+    sageSourceId: "source.fe51221f6743ee52",
+  },
+  // Archivist writes durable Markdown to Obsidian, then mirrors it through
+  // the Inquirer Memory API. The API owns the backing database; Archivist does
+  // not connect to SurrealDB or any local database directly.
+  memoryApi: {
+    enabled: true,
+    mode: "memory-api",
+    url: "https://api.enquirer.app",
+    namespace: "pi",
+    database: "memory",
+    tokenEnv: "SHERPA_MEMORY_API_TOKEN",
+  },
 };
 
-type ArchivistConfig = typeof DEFAULT_ARCHIVIST_CONFIG;
+type ArchivistConfig = typeof DEFAULT_ARCHIVIST_CONFIG & {
+  memoryStore?: { surreal?: MemoryApiStoreConfig };
+  memoryApi?: MemoryApiStoreConfig;
+};
+type DocumentationModelRuntime = { modelRegistry: ExtensionContext["modelRegistry"]; signal: AbortSignal };
+type ArchivistNotify = (message: string, level?: "info" | "success" | "warning" | "error") => void;
+
+function createSafeNotifier(ctx: ExtensionContext): ArchivistNotify | undefined {
+  try {
+    if (!ctx.hasUI) return undefined;
+    const ui = ctx.ui;
+    return (message, level = "info") => {
+      try { ui.notify(message, level); } catch { /* UI may disappear during session reload/shutdown. */ }
+    };
+  } catch {
+    return undefined;
+  }
+}
+
+function sendArchivistMessage(pi: ExtensionAPI, message: Parameters<ExtensionAPI["sendMessage"]>[0]) {
+  try { pi.sendMessage(message, { triggerTurn: false }); } catch { /* Extension runner may be stale after reload/session replacement. */ }
+}
 
 function mergeConfig<T>(base: T, over: any): T {
   if (!over || typeof over !== "object") return structuredClone(base);
@@ -58,12 +104,15 @@ function loadConfig(cwd: string): ArchivistConfig {
   const cfg = structuredClone(DEFAULT_ARCHIVIST_CONFIG);
   cfg.memory.obsidianMemoryPath = projectMemoryRel(cwd);
 
-  // Reuse Sherpa's existing memory/model configuration as the base contract.
+  // Reuse Sherpa's existing memory configuration as the base contract.
+  // Do not inherit Sherpa's model: Archivist must stay on its own dedicated
+  // lower model (default: minimax/MiniMax-M2.7-highspeed) unless explicitly
+  // overridden by .pi/archivist.config.json.
   const globalSherpa = readJsonIfExists(path.join(process.env.HOME || "/Users/kamil", ".pi", "sherpa.config.json"));
   const projectSherpa = readJsonIfExists(path.join(cwd, ".pi", "sherpa.config.json"));
   for (const sherpa of [globalSherpa, projectSherpa]) {
-    if (sherpa?.model) (cfg as any).model = mergeConfig(cfg.model, sherpa.model);
     if (sherpa?.memory) (cfg as any).memory = mergeConfig(cfg.memory, sherpa.memory);
+    if (sherpa?.memoryStore) (cfg as any).memoryStore = mergeConfig(cfg.memoryStore, sherpa.memoryStore);
   }
 
   const projectArchivist = readJsonIfExists(path.join(cwd, ".pi", "archivist.config.json"));
@@ -73,6 +122,255 @@ function loadConfig(cwd: string): ArchivistConfig {
 function obsidianMemoryPath(cfg: ArchivistConfig) {
   const configured = cfg.memory.obsidianMemoryPath || DEFAULT_ARCHIVIST_CONFIG.memory.obsidianMemoryPath;
   return path.isAbsolute(configured) ? configured : path.join(cfg.memory.obsidianVault, configured);
+}
+
+function archivistMemoryApiConfig(cfg: ArchivistConfig): MemoryApiStoreConfig {
+  // Backward compatibility: older Sherpa/Archivist configs named the Memory
+  // API mirror `memoryStore.surreal`. Treat that as an API endpoint config only;
+  // it must not imply direct database access from Archivist.
+  return mergeConfig(cfg.memoryApi ?? DEFAULT_ARCHIVIST_CONFIG.memoryApi, cfg.memoryStore?.surreal);
+}
+
+function archivistMemoryStore(cfg: ArchivistConfig) {
+  const memoryCfg = archivistMemoryApiConfig(cfg);
+  return memoryCfg.enabled ? new MemoryApiStore(memoryCfg) : undefined;
+}
+
+async function mirrorArtifactToMemoryApi(cfg: ArchivistConfig, artifact: MemoryArtifact) {
+  const store = archivistMemoryStore(cfg);
+  if (!store) return;
+  await store.writeArtifact(artifact).catch(() => undefined);
+}
+
+function cloudflareAccessCookie(url: string): string | undefined {
+  try {
+    const host = new URL(url).hostname;
+    const dir = path.join(homedir(), ".cloudflared");
+    if (!existsSync(dir)) return undefined;
+    const tokenFile = readdirSync(dir).find((name) => name.startsWith(`${host}-`) && name.endsWith("-token"));
+    if (!tokenFile) return undefined;
+    const token = readFileSync(path.join(dir, tokenFile), "utf8").trim();
+    return token ? `CF_Authorization=${token}` : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+function memoryApiHeaders(cfg: ArchivistConfig): Record<string, string> {
+  const headers: Record<string, string> = { Accept: "application/json", "Content-Type": "application/json" };
+  const memoryCfg = archivistMemoryApiConfig(cfg);
+  const token = (memoryCfg as any).token
+    || ((memoryCfg as any).tokenEnv ? process.env[(memoryCfg as any).tokenEnv] : undefined)
+    || process.env.SHERPA_MEMORY_API_TOKEN
+    || process.env.MEMORY_API_TOKEN
+    || (memoryCfg.url.includes("127.0.0.1") || memoryCfg.url.includes("localhost") ? "dev-token" : undefined);
+  if (token) headers.Authorization = `Bearer ${token}`;
+  const cfCookie = cloudflareAccessCookie(memoryCfg.url);
+  if (cfCookie) headers.Cookie = cfCookie;
+  return headers;
+}
+
+async function memoryApiGet(cfg: ArchivistConfig, path: string) {
+  const memoryCfg = archivistMemoryApiConfig(cfg);
+  if (!memoryCfg.enabled) throw new Error("memory API mirror is disabled");
+  const response = await fetch(`${memoryCfg.url.replace(/\/$/, "")}${path}`, {
+    headers: memoryApiHeaders(cfg),
+    signal: AbortSignal.timeout(5000),
+  });
+  if (!response.ok) throw new Error(`memory API ${response.status}: ${await response.text()}`);
+  return await response.json();
+}
+
+async function memoryApiPost(cfg: ArchivistConfig, apiPath: string, body: unknown) {
+  const memoryCfg = archivistMemoryApiConfig(cfg);
+  if (!memoryCfg.enabled) throw new Error("memory API mirror is disabled");
+  const response = await fetch(`${memoryCfg.url.replace(/\/$/, "")}${apiPath}`, {
+    method: "POST",
+    headers: memoryApiHeaders(cfg),
+    body: JSON.stringify(body),
+    signal: AbortSignal.timeout(10000),
+  });
+  if (!response.ok) throw new Error(`memory API ${response.status}: ${await response.text()}`);
+  return await response.json();
+}
+
+async function ingestObsidianDocumentToMemoryApi(cfg: ArchivistConfig, cwd: string, file: string) {
+  const memoryCfg = archivistMemoryApiConfig(cfg);
+  if (!memoryCfg.enabled) return { ingested: false, reason: "memory API mirror is disabled" };
+  if (!file.endsWith(".md")) return { ingested: false, reason: "not a markdown document" };
+  const resolved = path.resolve(file);
+  if (!existsSync(resolved) || !statSync(resolved).isFile()) return { ingested: false, reason: `document not found: ${file}` };
+  const project = path.basename(cwd);
+  const vault = path.resolve(cfg.memory.obsidianVault);
+  const rel = path.relative(vault, resolved).replace(/\\/g, "/");
+  if (!rel.startsWith("..") && !path.isAbsolute(rel)) {
+    await memoryApiPost(cfg, "/api/v1/memory/ingest-vault", {
+      vaultPath: vault,
+      includePaths: [rel],
+      limit: 1,
+      dryRun: false,
+      scope: "project",
+      project,
+      tags: ["obsidian", "vault-ingest", "archivist"],
+    });
+    return { ingested: true, path: rel, mode: "vault" };
+  }
+
+  const raw = readFileSync(resolved, "utf8");
+  const title = titleFromMarkdown(raw, path.basename(resolved, ".md"));
+  const artifactId = stableMemoryId("archivist-note", resolved);
+  await memoryApiPost(cfg, "/api/v1/memory/ingest", {
+    artifact: {
+      id: artifactId,
+      scope: "project",
+      project,
+      type: "obsidian-note",
+      title,
+      text: raw.slice(0, 24000),
+      sourcePath: resolved,
+      sourceHash: createHash("sha256").update(raw).digest("hex"),
+      confidence: "medium",
+      status: "active",
+      tags: ["obsidian", "archivist"],
+      aliases: [title, path.basename(resolved)],
+      routes: [resolved],
+      keywords: [title, path.basename(resolved)],
+    },
+    sourceText: raw,
+  });
+  return { ingested: true, path: resolved, mode: "direct" };
+}
+
+function recordMemoryIngestFailure(cwd: string, file: string, error: unknown) {
+  try {
+    const logFile = path.join(cwd, ".pi-memory", "archivist-inquirer-ingest-failures.jsonl");
+    mkdirSync(path.dirname(logFile), { recursive: true });
+    const message = error instanceof Error ? error.message : String(error);
+    appendFileSync(logFile, `${JSON.stringify({ at: nowIso(), file, error: message })}\n`);
+    // Also emit to stderr so failures are visible in extension logs. Do not
+    // create an Obsidian inbox note here: that could recurse into another ingest.
+    console.warn(`[archivist] Inquirer ingest failed for ${file}: ${message}`);
+  } catch {
+    // Last-resort best effort only; do not break the primary Archivist write.
+  }
+}
+
+function triggerObsidianDocumentIngest(cfg: ArchivistConfig, cwd: string, file: string | null | undefined) {
+  if (!file) return;
+  void ingestObsidianDocumentToMemoryApi(cfg, cwd, file).catch((error) => recordMemoryIngestFailure(cwd, file, error));
+}
+
+function triggerObsidianDocumentsFromSyncResult(cfg: ArchivistConfig, cwd: string, syncResult: string) {
+  for (const match of syncResult.matchAll(/->\s+([^\n]+\.md)\b/g)) {
+    const rawPath = match[1]?.trim();
+    if (!rawPath || rawPath.includes(" (dry-run)")) continue;
+    triggerObsidianDocumentIngest(cfg, cwd, path.resolve(cwd, rawPath));
+  }
+}
+
+function documentationJobLogPath(cfg: ArchivistConfig, cwd: string) {
+  const configured = cfg.documentationJobs?.logPath || DEFAULT_ARCHIVIST_CONFIG.documentationJobs.logPath;
+  return path.isAbsolute(configured) ? configured : path.join(cwd, configured);
+}
+
+function appendDocumentationJobLog(cfg: ArchivistConfig, cwd: string, event: Record<string, unknown>) {
+  try {
+    const target = documentationJobLogPath(cfg, cwd);
+    mkdirSync(path.dirname(target), { recursive: true });
+    appendFileSync(target, `${JSON.stringify({ schemaVersion: 1, at: nowIso(), project: path.basename(cwd), pid: process.pid, ...event })}\n`);
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    console.warn(`[archivist] documentation job log failed: ${message}`);
+  }
+}
+
+function summarizeFeedbackForReview(feedback: RetrievalFeedbackRecord[]) {
+  const missing = new Map<string, number>();
+  const noisy = new Map<string, number>();
+  const queries: string[] = [];
+  for (const item of feedback) {
+    if (item.query && queries.length < 8 && !queries.includes(item.query)) queries.push(item.query);
+    for (const miss of item.missing ?? []) missing.set(miss, (missing.get(miss) ?? 0) + 1);
+    for (const id of item.unusedIds ?? []) noisy.set(id, (noisy.get(id) ?? 0) + 1);
+  }
+  const top = (map: Map<string, number>) => [...map.entries()].sort((a, b) => b[1] - a[1]).slice(0, 12);
+  return { queries, missing: top(missing), noisy: top(noisy) };
+}
+
+async function writeFeedbackReviewToMemoryApi(store: MemoryApiStore, cfg: ArchivistConfig, cwd: string, feedback: RetrievalFeedbackRecord[], inboxPath: string) {
+  const summary = summarizeFeedbackForReview(feedback);
+  const now = nowIso();
+  const project = path.basename(cwd);
+  const reviewId = stableMemoryId("feedback-review", `${today()}\n${JSON.stringify(summary)}`);
+  const text = feedbackReviewMarkdown(feedback);
+  await store.writeArtifact({
+    id: reviewId,
+    scope: "project",
+    project,
+    type: "inbox",
+    title: "memory API retrieval feedback graph review",
+    summary: `Review candidate from ${feedback.length} Sherpa retrieval feedback records.`,
+    text,
+    sourcePath: path.relative(cwd, inboxPath).replace(/\\/g, "/"),
+    confidence: "medium",
+    status: "needs-review",
+    tags: ["archivist", "memory-api", "feedback", "needs-review"],
+    aliases: ["memory API feedback review", "graph memory feedback"],
+    keywords: ["feedback", "missing context", "noisy artifacts", "graph review"],
+    createdAt: now,
+    updatedAt: now,
+  }).catch(() => undefined);
+
+  for (const [missingPath] of summary.missing.slice(0, 12)) {
+    const fileId = sourceFileArtifactId(missingPath);
+    await store.writeArtifact({
+      id: fileId,
+      scope: "project",
+      project,
+      type: "source-file",
+      title: missingPath,
+      summary: `Source-file candidate repeatedly missed by Sherpa retrieval feedback: ${missingPath}`,
+      text: missingPath,
+      sourcePath: `repo://${missingPath}`,
+      confidence: "low",
+      status: "needs-review",
+      tags: ["source-file", "feedback", "needs-review"],
+      aliases: [missingPath, path.basename(missingPath)],
+      routes: [missingPath],
+      keywords: [missingPath, path.basename(missingPath)],
+      createdAt: now,
+      updatedAt: now,
+    }).catch(() => undefined);
+    await store.writeRelation({ from: reviewId, relation: "related", to: fileId, confidence: "low", source: inboxPath, createdAt: now }).catch(() => undefined);
+  }
+
+  for (const [noisyId] of summary.noisy.slice(0, 12)) {
+    await store.writeRelation({ from: reviewId, relation: "related", to: noisyId, confidence: "low", source: inboxPath, createdAt: now }).catch(() => undefined);
+  }
+}
+
+function feedbackReviewMarkdown(feedback: RetrievalFeedbackRecord[]) {
+  const summary = summarizeFeedbackForReview(feedback);
+  return [
+    "Sherpa retrieval feedback indicates possible memory graph maintenance opportunities.",
+    "Archivist should treat these as review candidates, not automatic current-truth updates.",
+    "",
+    `Feedback records reviewed: ${feedback.length}`,
+    "",
+    "## Repeated missing context",
+    ...(summary.missing.length ? summary.missing.map(([item, count]) => `- ${item} (${count}x)`) : ["- none"]),
+    "",
+    "## Repeated noisy/unused memory API artifacts",
+    ...(summary.noisy.length ? summary.noisy.map(([item, count]) => `- ${item} (${count}x)`) : ["- none"]),
+    "",
+    "## Example queries",
+    ...(summary.queries.length ? summary.queries.map((query) => `- ${query}`) : ["- none"]),
+    "",
+    "## Suggested review actions",
+    "- Add aliases/routes for repeated missing paths only when supported by source evidence.",
+    "- Add or strengthen graph relations only when a source-grounded bridge exists.",
+    "- Mark repeatedly noisy artifacts or edges as needs-review rather than deleting evidence.",
+  ].join("\n");
 }
 
 
@@ -112,6 +410,7 @@ function appendInboxNote(cfg: ArchivistConfig, cwd: string, title: string, text:
     text.trim(),
     "",
   ].join("\n"));
+  triggerObsidianDocumentIngest(cfg, cwd, target);
   return target;
 }
 
@@ -119,6 +418,7 @@ function appendJournalNote(cfg: ArchivistConfig, cwd: string, title: string, tex
   const target = path.join(obsidianMemoryPath(cfg), "journal", `${today()}.md`);
   mkdirSync(path.dirname(target), { recursive: true });
   appendFileSync(target, `\n## ${title} — ${path.basename(cwd)}\n\n${text.trim()}\n`);
+  triggerObsidianDocumentIngest(cfg, cwd, target);
   return target;
 }
 
@@ -128,74 +428,150 @@ function autoMemoryConfig(cfg: ArchivistConfig, cwd: string) {
     obsidianVault: cfg.memory.obsidianVault,
     obsidianMemoryPath: obsidianMemoryPath(cfg),
     // Keep scratchpad ownership in Sherpa. Archivist redirects review candidates
-    // to durable Obsidian inbox instead of appending .pi-memory/scratchpad.
-    appendScratchpadCandidate: (text: string, title?: string) => { appendInboxNote(cfg, cwd, title || "Archivist candidate", text); },
+    // to durable Obsidian journal (chronological record) instead of inbox.
+    appendScratchpadCandidate: (text: string, title?: string) => { appendJournalNote(cfg, cwd, title || "Archivist candidate", text); },
   };
 }
 
-function parseGitStatusFiles(status: string) {
-  const files: string[] = [];
-  for (const line of status.split(/\r?\n/)) {
-    const trimmed = line.trim();
-    if (!trimmed) continue;
-    const parts = trimmed.split(/\s+/);
-    const candidate = parts[parts.length - 1]?.replace(/^"|"$/g, "");
-    if (candidate) files.push(candidate);
-  }
-  return [...new Set(files)];
-}
-function isDocumentationPath(file: string) { return /(^|\/)(readme|docs?|adr|changelog|agents)\b|\.(md|mdx|rst)$/i.test(file); }
-function isSourcePath(file: string) {
-  if (isDocumentationPath(file)) return false;
-  return /\.(ts|tsx|js|jsx|mjs|cjs|py|rs|go|java|kt|swift|rb|php|sh|sql|json|toml|yaml|yml|env|ini|config)$/i.test(file)
-    || /(^|\/)(package\.json|Dockerfile|docker-compose|Makefile|migrations?|scripts?|config|schema|routes?)\b/i.test(file);
-}
 async function gitChanged(cwd: string) {
   try { return await git(cwd, ["status", "--short"]); } catch { return ""; }
 }
-function findDocumentationCandidates(cwd: string, changedSources: string[]) {
-  const candidates = new Set<string>();
-  for (const rel of ["README.md", "docs/README.md", "AGENTS.md", "CHANGELOG.md"]) if (existsSync(path.join(cwd, rel))) candidates.add(rel);
-  const terms = changedSources.flatMap((file) => file.split(/[\\/._-]+/).filter((part) => part.length >= 4)).slice(0, 20);
-  const roots = ["docs"];
-  const visit = (dir: string) => {
-    if (!existsSync(dir)) return;
-    for (const name of readdirSync(dir).slice(0, 200)) {
-      const full = path.join(dir, name);
-      try {
-        const st = statSync(full);
-        if (st.isDirectory()) visit(full);
-        else if (/\.(md|mdx|rst)$/i.test(name)) {
-          const raw = readFileSync(full, "utf8").toLowerCase();
-          if (!terms.length || terms.some((term) => raw.includes(term.toLowerCase()))) candidates.add(path.relative(cwd, full));
-        }
-      } catch { /* ignore */ }
-    }
-  };
-  for (const root of roots) visit(path.join(cwd, root));
-  return [...candidates].slice(0, 8);
+
+function parsePorcelainStatusFiles(status: string): string[] {
+  const files: string[] = [];
+  for (const line of status.split(/\r?\n/)) {
+    if (!line.trim()) continue;
+    const match = line.match(/^(.{2})\s+(.*)$/);
+    if (!match) continue;
+    const raw = match[2]?.trim() ?? "";
+    const file = (raw.includes(" -> ") ? raw.split(" -> ").pop()!.trim() : raw).replace(/^"|"$/g, "");
+    if (file) files.push(file);
+  }
+  return [...new Set(files)];
 }
-async function auditDocumentationDrift(state: ArchivistState, cfg: ArchivistConfig, cwd: string, changedFilesOverride?: string[]) {
-  const status = await gitChanged(cwd);
-  const files = changedFilesOverride ?? parseGitStatusFiles(status);
-  const changedSources = files.filter(isSourcePath);
-  if (!changedSources.length) return { needed: false, reason: "no source changes" };
-  const changedDocs = files.filter(isDocumentationPath);
-  if (changedDocs.length) return { needed: false, reason: "documentation changed with source", changedSources, changedDocs };
-  const hash = hashAutoMemory(`archivist-doc-audit\n${changedSources.sort().join("\n")}`);
-  if (state.autoMemory.docAuditHashes.includes(hash)) return { needed: false, reason: "already audited", changedSources };
-  const candidates = findDocumentationCandidates(cwd, changedSources);
-  appendInboxNote(cfg, cwd, "Documentation drift audit", [
-    "Archivist detected source/config changes without documentation changes.",
-    "",
-    "Changed source/config files:",
-    ...changedSources.map((file) => `- ${file}`),
-    "",
-    candidates.length ? "Likely documentation to review:" : "No obvious documentation file found; decide whether README/docs need a note.",
-    ...candidates.map((file) => `- ${file}`),
-  ].join("\n"));
+
+async function gitChangedFiles(cwd: string) {
+  try { return parsePorcelainStatusFiles(await git(cwd, ["status", "--porcelain=v1", "--untracked-files=all"])); }
+  catch { return parseGitStatusFiles(await gitChanged(cwd)); }
+}
+
+const DOC_DRIFT_DEDUP_FILE = ".pi-memory/archivist-doc-drift-dedup.jsonl";
+
+function docDriftDedupPath(cwd: string) {
+  return path.join(cwd, DOC_DRIFT_DEDUP_FILE);
+}
+
+function hasSeenDocDriftAudit(cwd: string, fingerprint: string) {
+  const target = docDriftDedupPath(cwd);
+  if (!existsSync(target)) return false;
+  const lines = readFileSync(target, "utf8").split(/\r?\n/).filter(Boolean).slice(-200);
+  return lines.some((line) => {
+    try { return JSON.parse(line).fingerprint === fingerprint; }
+    catch { return false; }
+  });
+}
+
+function recordDocDriftAudit(cwd: string, fingerprint: string, result: string) {
+  const target = docDriftDedupPath(cwd);
+  mkdirSync(path.dirname(target), { recursive: true });
+  appendFileSync(target, `${JSON.stringify({ at: nowIso(), fingerprint, result })}\n`);
+}
+
+/**
+ * Model-based documentation drift audit.
+ *
+ * Replaces regex heuristics (isSourcePath, isDocumentationPath,
+ * findDocumentationCandidates) with the Archivist model reading the
+ * actual changed files and diffs to decide if documentation needs updating.
+ */
+async function auditDocumentationDrift(
+  state: ArchivistState,
+  cfg: ArchivistConfig,
+  cwd: string,
+  runtime: { modelRegistry: ExtensionContext["modelRegistry"]; signal: AbortSignal },
+  changedFilesOverride?: string[],
+) {
+  const files = changedFilesOverride ?? await gitChangedFiles(cwd);
+  if (!files.length) return { needed: false, reason: "no changes" };
+
+  const sortedFiles = [...files].sort();
+  const fingerprintDiff = await git(cwd, ["diff", "--", ...sortedFiles]).catch(() => "");
+  const persistentFingerprint = createHash("sha256").update(`${sortedFiles.join("\n")}\n---diff---\n${fingerprintDiff}`).digest("hex");
+  const hash = hashAutoMemory(`archivist-doc-audit\n${persistentFingerprint}`);
+  if (state.autoMemory.docAuditHashes.includes(hash)) return { needed: false, reason: "already audited", changedSources: files };
+  if (hasSeenDocDriftAudit(cwd, persistentFingerprint)) return { needed: false, reason: "identical documentation drift already evaluated", changedSources: files };
+
+  // Ask the model to assess whether docs need updating.
+  let candidates: string[] = [];
+  if (!cfg.model.heuristicOnly) {
+    const model = runtime.modelRegistry.find(cfg.model.provider, cfg.model.id);
+    if (model) {
+      const auth = await runtime.modelRegistry.getApiKeyAndHeaders(model);
+      if (auth.ok && auth.apiKey) {
+        const diff = await git(cwd, ["diff", "--", ...files]).catch(() => "");
+
+        // Gather existing docs for context
+        const docSnippets: string[] = [];
+        for (const rel of ["README.md", "AGENTS.md", "CHANGELOG.md", "docs/README.md"]) {
+          const p = path.join(cwd, rel);
+          if (existsSync(p)) docSnippets.push(`--- ${rel} ---\n${readFileSync(p, "utf8").slice(0, 4000)}`);
+        }
+        if (existsSync(path.join(cwd, "docs"))) {
+          for (const name of readdirSync(path.join(cwd, "docs")).slice(0, 30)) {
+            if (!/\.(md|mdx|rst)$/i.test(name)) continue;
+            const p = path.join(cwd, "docs", name);
+            docSnippets.push(`--- docs/${name} ---\n${readFileSync(p, "utf8").slice(0, 3000)}`);
+          }
+        }
+
+        const prompt = [
+          "You are Archivist, a documentation maintenance agent.",
+          "Analyze the changed files and their diffs. Decide if repo-local documentation needs updating.",
+          "",
+          "Return ONLY JSON in this exact shape:",
+          '{"needsUpdate": true|false, "reason": "brief explanation", "candidateDocs": ["relative/path/to/doc.md"] }',
+          "",
+          "Rules:",
+          "- needsUpdate=true when code/config changes alter behavior, API, usage, or architecture that is documented",
+          "- needsUpdate=false when changes are internal-only, tests, formatting, or clearly don't affect user-facing docs",
+          "- candidateDocs should list documentation files that likely need review (max 5); use repo-relative paths only, never absolute paths or ../ traversal",
+          "- If no docs exist yet and behavior changed significantly, set needsUpdate=true with empty candidateDocs",
+        ].join("\n");
+
+        const message: UserMessage = {
+          role: "user",
+          timestamp: Date.now(),
+          content: [{ type: "text", text: [
+            `Changed files:\n${files.join("\n")}`,
+            `\nDiff excerpt:\n${diff.slice(0, 20000)}`,
+            docSnippets.length ? `\nExisting docs:\n${docSnippets.join("\n\n")}` : "\nNo existing documentation found.",
+          ].join("\n\n") }],
+        };
+
+        const response = await complete(model, { systemPrompt: prompt, messages: [message] }, { apiKey: auth.apiKey, headers: auth.headers, signal: runtime.signal });
+        if (response.stopReason !== "aborted") {
+          const text = response.content.filter((c): c is { type: "text"; text: string } => c.type === "text").map(c => c.text).join("\n").trim();
+          const start = text.indexOf("{");
+          const end = text.lastIndexOf("}");
+          if (start >= 0 && end > start) {
+            try {
+              const parsed = JSON.parse(text.slice(start, end + 1)) as { needsUpdate?: boolean; reason?: string; candidateDocs?: string[] };
+              if (!parsed.needsUpdate) {
+                state.autoMemory.docAuditHashes = [...state.autoMemory.docAuditHashes.slice(-49), hash];
+                recordDocDriftAudit(cwd, persistentFingerprint, "no_update");
+                return { needed: false, reason: parsed.reason || "model decided no update needed", changedSources: files };
+              }
+              candidates = safeExistingDocCandidates(cwd, parsed.candidateDocs).slice(0, 8);
+            } catch { /* ignore parse failure, fall through to allow */ }
+          }
+        }
+      }
+    }
+  }
+
   state.autoMemory.docAuditHashes = [...state.autoMemory.docAuditHashes.slice(-49), hash];
-  return { needed: true, hash, changedSources, candidates };
+  recordDocDriftAudit(cwd, persistentFingerprint, "needs_update");
+  return { needed: true, hash, changedSources: files, candidates };
 }
 function documentationAuditMessage(audit: { changedSources?: string[]; candidates?: string[] }) {
   const sources = audit.changedSources ?? [];
@@ -204,7 +580,7 @@ function documentationAuditMessage(audit: { changedSources?: string[]; candidate
     "## Archivist Documentation Audit",
     "",
     "Archivist detected code/config changes without accompanying documentation updates.",
-    "Review whether docs should be updated before considering the task complete.",
+    "Archivist will handle the documentation maintenance path using its dedicated model; the main agent should not edit repo docs for this audit.",
     "Policy source: Sherpa DOCUMENTATION.md, now enforced by Archivist write-side maintenance.",
     `Technical doc writer skill for substantial doc authoring: ${TECH_DOC_WRITER_SKILL_PATH}`,
     "",
@@ -216,17 +592,241 @@ function documentationAuditMessage(audit: { changedSources?: string[]; candidate
   ].join("\n");
 }
 
-function parseSyncArgs(args?: string) {
-  const parts = args?.trim() ? args.trim().split(/\s+/) : [];
-  const out: { refId?: string; destination?: string; dryRun?: boolean; since?: string } = {};
-  for (let i = 0; i < parts.length; i++) {
-    const part = parts[i]!;
-    if (part === "--dry-run") out.dryRun = true;
-    if (part === "--ref-id") out.refId = parts[++i];
-    if (part === "--destination") out.destination = parts[++i];
-    if (part === "--since") out.since = parts[++i];
+function documentationMaintenanceReport(handled: { handled?: boolean; applied?: string[]; failures?: string[]; result?: DocumentationMaintenanceResult }) {
+  const applied = [...new Set(handled.applied ?? [])];
+  const failures = handled.failures ?? [];
+  const decision = handled.result?.decision ?? "handoff";
+  return [
+    "## Archivist Documentation Maintenance Complete",
+    "",
+    `Decision: ${decision}`,
+    `Summary: ${handled.result?.summary ?? "(none)"}`,
+    "",
+    "### Updated documentation",
+    ...(applied.length ? applied.map((file) => `- ${file}`) : ["- None"]),
+    "",
+    "### Skipped/failed updates",
+    ...(failures.length ? failures.map((failure) => `- ${failure}`) : ["- None"]),
+    "",
+    handled.handled
+      ? "Archivist completed documentation maintenance asynchronously using its dedicated model."
+      : "Archivist could not safely apply documentation changes automatically; a handoff was written to the Archivist inbox.",
+  ].join("\n");
+}
+
+type DocumentationUpdate = {
+  path?: string;
+  oldText?: string;
+  newText?: string;
+  reason?: string;
+};
+
+type DocumentationMaintenanceResult = {
+  decision?: "updated" | "no_update" | "handoff";
+  summary?: string;
+  updates?: DocumentationUpdate[];
+  handoff?: string;
+};
+
+function parseJsonCandidate(candidate: string): any | undefined {
+  const sanitized = candidate.trim().replace(/^\uFEFF/, "").replace(/[\u0000-\u0008\u000B\u000C\u000E-\u001F]/g, "");
+  if (!sanitized) return undefined;
+  try { return JSON.parse(sanitized); } catch { return undefined; }
+}
+
+function balancedJsonObjects(text: string): string[] {
+  const objects: string[] = [];
+  let start = -1;
+  let depth = 0;
+  let inString = false;
+  let escaped = false;
+
+  for (let i = 0; i < text.length; i++) {
+    const char = text[i];
+    if (inString) {
+      if (escaped) escaped = false;
+      else if (char === "\\") escaped = true;
+      else if (char === '"') inString = false;
+      continue;
+    }
+
+    if (char === '"') {
+      inString = true;
+      continue;
+    }
+    if (char === "{") {
+      if (depth === 0) start = i;
+      depth++;
+      continue;
+    }
+    if (char === "}" && depth > 0) {
+      depth--;
+      if (depth === 0 && start >= 0) {
+        objects.push(text.slice(start, i + 1));
+        start = -1;
+      }
+    }
   }
-  return out;
+  return objects;
+}
+
+function extractJsonObject(text: string): any | undefined {
+  const candidates: string[] = [];
+  for (const match of text.matchAll(/```(?:json)?\s*([\s\S]*?)```/gi)) candidates.push(match[1] ?? "");
+  candidates.push(text);
+
+  for (const candidate of candidates) {
+    const direct = parseJsonCandidate(candidate);
+    if (direct) return direct;
+    for (const object of balancedJsonObjects(candidate)) {
+      const parsed = parseJsonCandidate(object);
+      if (parsed) return parsed;
+    }
+  }
+  return undefined;
+}
+
+function safeRepoRelativePath(cwd: string, candidate: string): string | undefined {
+  if (!candidate || path.isAbsolute(candidate)) return undefined;
+  const resolved = path.resolve(cwd, candidate);
+  const rel = path.relative(cwd, resolved);
+  if (!rel || rel.startsWith("..") || path.isAbsolute(rel)) return undefined;
+  return rel.replace(/\\/g, "/");
+}
+
+function safeExistingDocCandidates(cwd: string, candidates: string[] = []): string[] {
+  return [...new Set(candidates
+    .map((candidate) => safeRepoRelativePath(cwd, candidate))
+    .filter((candidate): candidate is string => !!candidate && existsSync(path.join(cwd, candidate))))];
+}
+
+async function modelDocumentationMaintenance(runtime: DocumentationModelRuntime, cfg: ArchivistConfig, cwd: string, audit: { changedSources?: string[]; candidates?: string[] }): Promise<DocumentationMaintenanceResult> {
+  if (cfg.model.heuristicOnly) return { decision: "handoff", summary: "Archivist model is configured as heuristic-only.", handoff: documentationAuditMessage(audit) };
+  const model = runtime.modelRegistry.find(cfg.model.provider, cfg.model.id);
+  if (!model) return { decision: "handoff", summary: `Archivist model not found: ${cfg.model.provider}/${cfg.model.id}`, handoff: documentationAuditMessage(audit) };
+  const auth = await runtime.modelRegistry.getApiKeyAndHeaders(model);
+  if (!auth.ok || !auth.apiKey) return { decision: "handoff", summary: auth.ok ? `No API key for ${model.provider}` : auth.error, handoff: documentationAuditMessage(audit) };
+
+  const changedSources = audit.changedSources ?? [];
+  const candidates = safeExistingDocCandidates(cwd, audit.candidates).slice(0, 8);
+  const diff = await git(cwd, ["diff", "--", ...changedSources]).catch(() => "");
+  const docs = candidates.map((file) => {
+    const text = readFileSync(path.join(cwd, file), "utf8");
+    return `--- DOC ${file} ---\n${text.slice(0, 18000)}`;
+  }).join("\n\n");
+
+  const prompt = [
+    "You are Archivist, Sherpa's write-side documentation maintenance agent.",
+    "Use the dedicated Archivist model only; do not delegate repo documentation decisions to the main coding agent.",
+    "Decide whether the changed source/config files require repo-local documentation updates.",
+    "If a small, source-grounded update is needed, return exact text replacements for existing documentation files.",
+    "If substantial prose/API/architecture documentation is needed, do not author it; return a technical-doc-writer handoff instead.",
+    "If no repo documentation update is warranted, return no_update with a brief reason.",
+    "Return ONLY strict JSON matching this shape, with no markdown fences or commentary:",
+    '{ "decision": "updated|no_update|handoff", "summary": "...", "updates": [{ "path": "docs/file.md", "oldText": "exact existing text", "newText": "replacement text", "reason": "..." }], "handoff": "optional markdown" }',
+    "Rules: update only files included in Candidate docs; oldText must be copied exactly from provided doc content; keep changes minimal and factual; escape newlines inside JSON strings as \\n.",
+  ].join("\n");
+  const message: UserMessage = {
+    role: "user",
+    timestamp: Date.now(),
+    content: [{ type: "text", text: [
+      `Changed source/config files:\n${changedSources.join("\n")}`,
+      `Candidate docs:\n${candidates.join("\n") || "(none)"}`,
+      `Source diff:\n${diff.slice(0, 30000)}`,
+      `Current candidate doc excerpts:\n${docs || "(none)"}`,
+    ].join("\n\n") }],
+  };
+  const response = await complete(model, { systemPrompt: prompt, messages: [message] }, { apiKey: auth.apiKey, headers: auth.headers, signal: runtime.signal });
+  if (response.stopReason === "aborted") return { decision: "handoff", summary: "Archivist model call aborted.", handoff: documentationAuditMessage(audit) };
+  const text = response.content.filter((c): c is { type: "text"; text: string } => c.type === "text").map(c => c.text).join("\n").trim();
+  const parsed = extractJsonObject(text) as DocumentationMaintenanceResult | undefined;
+  if (parsed) return parsed;
+
+  const repairPrompt = [
+    "You repair invalid JSON for Archivist documentation maintenance.",
+    "Return ONLY strict valid JSON matching this shape:",
+    '{ "decision": "updated|no_update|handoff", "summary": "...", "updates": [{ "path": "docs/file.md", "oldText": "exact existing text", "newText": "replacement text", "reason": "..." }], "handoff": "optional markdown" }',
+    "Do not add markdown fences or commentary. Escape newlines inside JSON strings as \\n. If the previous output cannot be safely repaired, return a handoff decision with a brief summary.",
+  ].join("\n");
+  const repairMessage: UserMessage = {
+    role: "user",
+    timestamp: Date.now(),
+    content: [{ type: "text", text: `Previous invalid output:\n${text.slice(0, 8000)}` }],
+  };
+  const repair = await complete(model, { systemPrompt: repairPrompt, messages: [repairMessage] }, { apiKey: auth.apiKey, headers: auth.headers, signal: runtime.signal });
+  if (repair.stopReason !== "aborted") {
+    const repairedText = repair.content.filter((c): c is { type: "text"; text: string } => c.type === "text").map(c => c.text).join("\n").trim();
+    const repaired = extractJsonObject(repairedText) as DocumentationMaintenanceResult | undefined;
+    if (repaired) return { ...repaired, summary: repaired.summary ? `${repaired.summary} (JSON repaired after invalid first response.)` : "JSON repaired after invalid first response." };
+  }
+
+  return { decision: "handoff", summary: "Archivist model returned unparsable documentation maintenance output after one repair attempt.", handoff: `${documentationAuditMessage(audit)}\n\nRaw model output:\n\n${text.slice(0, 4000)}` };
+}
+
+async function completeDocumentationDrift(runtime: DocumentationModelRuntime, cfg: ArchivistConfig, cwd: string, audit: { changedSources?: string[]; candidates?: string[] }) {
+  const jobId = stableMemoryId("doc-job", `${nowIso()}\n${audit.changedSources?.join("\n") ?? ""}\n${audit.candidates?.join("\n") ?? ""}`);
+  appendDocumentationJobLog(cfg, cwd, {
+    jobId,
+    kind: "documentation-maintenance",
+    status: "started",
+    trigger: "documentation-drift",
+    changedSources: audit.changedSources ?? [],
+    candidateDocs: audit.candidates ?? [],
+    model: `${cfg.model.provider}/${cfg.model.id}`,
+  });
+
+  try {
+    const result = await modelDocumentationMaintenance(runtime, cfg, cwd, audit);
+    const allowedDocs = new Set(safeExistingDocCandidates(cwd, audit.candidates));
+    const applied: string[] = [];
+    const failures: string[] = [];
+
+    if (result.decision === "updated") {
+      for (const update of result.updates ?? []) {
+        if (!update.path || !update.oldText || update.newText === undefined) continue;
+        const safeUpdatePath = safeRepoRelativePath(cwd, update.path);
+        if (!safeUpdatePath || !allowedDocs.has(safeUpdatePath)) {
+          failures.push(`${update.path}: not in Archivist candidate docs`);
+          continue;
+        }
+        const target = path.join(cwd, safeUpdatePath);
+        if (!existsSync(target)) {
+          failures.push(`${update.path}: file does not exist`);
+          continue;
+        }
+        const current = readFileSync(target, "utf8");
+        const count = current.split(update.oldText).length - 1;
+        if (count !== 1) {
+          failures.push(`${update.path}: oldText matched ${count} times`);
+          continue;
+        }
+        writeFileSync(target, current.replace(update.oldText, update.newText));
+        applied.push(safeUpdatePath);
+      }
+    }
+
+    if (applied.length) {
+      appendJournalNote(cfg, cwd, "Documentation drift handled", [`Archivist applied documentation updates with ${cfg.model.provider}/${cfg.model.id}.`, `Summary: ${result.summary ?? "(none)"}`, "", "Updated docs:", ...[...new Set(applied)].map((file) => `- ${file}`), failures.length ? "" : undefined, failures.length ? "Skipped/failed updates:" : undefined, ...failures.map((failure) => `- ${failure}`)].filter(Boolean).join("\n"));
+      appendDocumentationJobLog(cfg, cwd, { jobId, kind: "documentation-maintenance", status: "completed", decision: result.decision, summary: result.summary ?? "", applied: [...new Set(applied)], failures });
+      return { handled: true, applied, failures, result };
+    }
+
+    if (result.decision === "no_update") {
+      // Do not write durable memory for no-op documentation reviews. These are
+      // operationally useful in the moment but usually become journal noise.
+      appendDocumentationJobLog(cfg, cwd, { jobId, kind: "documentation-maintenance", status: "completed", decision: result.decision, summary: result.summary ?? "", applied: [], failures });
+      return { handled: true, applied, failures, result };
+    }
+
+    const note = [result.handoff || documentationAuditMessage(audit), failures.length ? "\nSkipped/failed updates:" : "", ...failures.map((failure) => `- ${failure}`)].join("\n");
+    const inboxNote = appendInboxNote(cfg, cwd, "Documentation drift technical-doc-writer handoff", note);
+    appendDocumentationJobLog(cfg, cwd, { jobId, kind: "documentation-maintenance", status: "handoff", decision: result.decision ?? "handoff", summary: result.summary ?? "", handoff: inboxNote, applied: [], failures });
+    return { handled: false, applied, failures, result };
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    appendDocumentationJobLog(cfg, cwd, { jobId, kind: "documentation-maintenance", status: "failed", error: message });
+    throw error;
+  }
 }
 
 async function git(cwd: string, args: string[]) {
@@ -234,73 +834,85 @@ async function git(cwd: string, args: string[]) {
   return stdout.trim();
 }
 
+function normalizeCatalogPathForCompare(value: string) {
+  return value.replace(/^repo:\/\//, "").replace(/\\/g, "/").replace(/^\.\//, "").replace(/\/$/, "");
+}
+
+function catalogCoversPath(cwd: string, targetRel: string) {
+  const normalizedTarget = normalizeCatalogPathForCompare(targetRel);
+  for (const row of readProjectCatalog(cwd)) {
+    const rowPath = normalizeCatalogPathForCompare(row.path ?? "");
+    if (!rowPath) continue;
+    try {
+      const resolved = resolveCatalogPath(cwd, row.path);
+      if (existsSync(resolved) && statSync(resolved).isDirectory()) {
+        const relDir = normalizeCatalogPathForCompare(path.relative(cwd, resolved));
+        if (normalizedTarget === relDir || normalizedTarget.startsWith(`${relDir}/`)) return true;
+      }
+    } catch { /* ignore broken catalog rows */ }
+    if (normalizedTarget === rowPath) return true;
+  }
+  return false;
+}
+
+function extractGraphifySourcePath(node: any): string | undefined {
+  const candidates = [node?.path, node?.file, node?.source, node?.source_path, node?.file_path, node?.filepath, node?.uri, node?.id];
+  for (const raw of candidates) {
+    if (typeof raw !== "string" || !raw.trim()) continue;
+    const value = raw.trim();
+    if (/^https?:\/\//i.test(value)) continue;
+    if (/\.(md|mdx|txt|rst|py|ts|tsx|js|jsx|json|yaml|yml|toml|csv|pdf)$/i.test(value) || value.includes("/")) return value;
+  }
+  return undefined;
+}
+
+function auditGraphifyOutput(cwd: string, targetArg?: string) {
+  const targetRoot = targetArg?.trim() ? (path.isAbsolute(targetArg.trim()) ? targetArg.trim() : path.join(cwd, targetArg.trim())) : cwd;
+  const outDir = path.join(targetRoot, "graphify-out");
+  const graphPath = path.join(outDir, "graph.json");
+  const reportPath = path.join(outDir, "GRAPH_REPORT.md");
+  if (!existsSync(graphPath)) return { ok: false as const, targetRoot, outDir, graphPath, reportPath, reason: "graphify-out/graph.json not found" };
+
+  const graph = JSON.parse(readFileSync(graphPath, "utf8"));
+  const nodes: any[] = Array.isArray(graph?.nodes) ? graph.nodes : Array.isArray(graph) ? graph : [];
+  const edges: any[] = Array.isArray(graph?.edges) ? graph.edges : Array.isArray(graph?.links) ? graph.links : [];
+  const sourceCounts = new Map<string, number>();
+  for (const node of nodes) {
+    const source = extractGraphifySourcePath(node);
+    if (!source) continue;
+    const abs = path.isAbsolute(source) ? source : path.resolve(targetRoot, source.replace(/^repo:\/\//, ""));
+    const rel = normalizeCatalogPathForCompare(path.relative(cwd, abs));
+    if (rel && !rel.startsWith("..")) sourceCounts.set(rel, (sourceCounts.get(rel) ?? 0) + 1);
+  }
+
+  const dirCounts = new Map<string, number>();
+  for (const rel of sourceCounts.keys()) {
+    const dir = normalizeCatalogPathForCompare(path.dirname(rel));
+    if (dir && dir !== ".") dirCounts.set(dir, (dirCounts.get(dir) ?? 0) + 1);
+  }
+
+  const suggestedDirectoryRows = [...dirCounts.entries()]
+    .filter(([dir, count]) => count >= 3 && !catalogCoversPath(cwd, dir))
+    .sort((a, b) => b[1] - a[1])
+    .slice(0, 12)
+    .map(([dir, fileCount]) => ({ dir, fileCount }));
+
+  const hotFiles = [...sourceCounts.entries()]
+    .filter(([rel]) => !catalogCoversPath(cwd, rel) && /(^|\/)(readme|index)\.(md|mdx|txt|rst)$/i.test(rel))
+    .sort((a, b) => b[1] - a[1])
+    .slice(0, 8)
+    .map(([file, nodeCount]) => ({ file, nodeCount }));
+
+  return { ok: true as const, targetRoot, outDir, graphPath, reportPath, nodes: nodes.length, edges: edges.length, sourceFiles: sourceCounts.size, suggestedDirectoryRows, hotFiles };
+}
+
 function today() { return new Date().toISOString().slice(0, 10); }
 function nowIso() { return new Date().toISOString(); }
 function slug(value: string) {
   return value.toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-+|-+$/g, "").slice(0, 80) || `commit-${Date.now()}`;
 }
-function hasDocsImpact(files: string[]) {
-  return files.some((file) => /(^|\/)(readme|docs|doc|adr|changelog)|\.(md|mdx|rst)$/i.test(file))
-    || files.some((file) => /(^|\/)(api|routes?|schema|config|cli|deploy|migrations?|docker|infra|scripts?)\b/i.test(file));
-}
-
-type CatalogRow = Record<string, string>;
-function parseCsvLine(line: string) {
-  const cells: string[] = [];
-  let current = "";
-  let quoted = false;
-  for (let i = 0; i < line.length; i++) {
-    const ch = line[i];
-    if (quoted && ch === '"' && line[i + 1] === '"') { current += '"'; i++; continue; }
-    if (ch === '"') { quoted = !quoted; continue; }
-    if (!quoted && ch === ",") { cells.push(current); current = ""; continue; }
-    current += ch;
-  }
-  cells.push(current);
-  return cells;
-}
-function csvCell(value: string) { return /[",\n]/.test(value) ? `"${value.replace(/"/g, '""')}"` : value; }
-function readCatalog(root: string): CatalogRow[] {
-  const target = path.join(root, "catalog.csv");
-  if (!existsSync(target)) return [];
-  const lines = readFileSync(target, "utf8").split(/\r?\n/).filter((line) => line.trim());
-  if (lines.length < 2) return [];
-  const header = parseCsvLine(lines[0]!).map((cell) => cell.trim());
-  return lines.slice(1).map((line) => {
-    const cells = parseCsvLine(line);
-    const row: CatalogRow = {};
-    header.forEach((key, index) => { row[key] = cells[index] ?? ""; });
-    return row;
-  }).filter((row) => row.id && row.path);
-}
-function scoreText(query: string, text: string) {
-  const words = new Set((query.toLowerCase().match(/[a-z0-9_./-]{3,}/g) ?? []).map((w) => w.replace(/^-+|-+$/g, "")));
-  let hits = 0;
-  const haystack = text.toLowerCase();
-  for (const word of words) if (word && haystack.includes(word)) hits++;
-  return words.size ? hits / words.size : 0;
-}
-function relevantCatalogRows(root: string, focus: string) {
-  return readCatalog(root)
-    .map((row) => ({ row, score: scoreText(focus, [row.id, row.type, row.path, row.title, row.summary, row.aliases, row.tags, row.routes, row.keywords, row.related, row.based_on, row.supports, row.implements, row.derives_from].filter(Boolean).join("\n")) }))
-    .filter((item) => item.score > 0.04)
-    .sort((a, b) => b.score - a.score)
-    .slice(0, 12)
-    .map((item) => item.row);
-}
-function appendCatalogRow(root: string, row: CatalogRow) {
-  const target = path.join(root, "catalog.csv");
-  const defaultHeader = ["id", "type", "path", "title", "summary", "aliases", "tags", "status", "confidence", "updated", "based_on", "supports", "implements", "derives_from", "related", "routes", "keywords"];
-  const existing = existsSync(target) ? readFileSync(target, "utf8") : "";
-  const header = existing.trim() ? parseCsvLine(existing.split(/\r?\n/)[0]!) : defaultHeader;
-  if (existing.includes(`${row.id},`) || existing.includes(`\"${row.id}\",`)) return;
-  mkdirSync(path.dirname(target), { recursive: true });
-  if (!existing.trim()) writeFileSync(target, header.join(",") + "\n");
-  appendFileSync(target, header.map((key) => csvCell(row[key] ?? "")).join(",") + "\n");
-}
 
 function heuristicSummary(input: { commit: string; message: string; stats: string; files: string[]; recent: string; catalogRows?: CatalogRow[] }) {
-  const docs = hasDocsImpact(input.files);
   return [
     `# Commit ${input.commit.slice(0, 12)}`,
     "",
@@ -308,7 +920,6 @@ function heuristicSummary(input: { commit: string; message: string; stats: strin
     "",
     `Changed files: ${input.files.length ? input.files.join(", ") : "unknown"}`,
     "",
-    `Documentation impact: ${docs ? "possible" : "not obvious"}`,
     `Catalog navigation: ${input.catalogRows?.length ? input.catalogRows.map((row) => `${row.id} -> ${row.path}`).join("; ") : "no matching catalog rows"}`,
     "",
     "## Systemic interpretation",
@@ -341,8 +952,10 @@ async function modelSummary(ctx: ExtensionContext, cfg: ArchivistConfig, input: 
     "Use the existing Sherpa catalog service surface (`catalog.csv`) to navigate where documentation lives before deciding what to write. Prefer catalog paths and relationships over folder guessing.",
     "Use Sherpa's existing Obsidian memory ontology only: wiki/systems, wiki/procedures, wiki/decisions, wiki/concepts, wiki/evidence, journal, inbox. Do not invent new categories.",
     "Analyze this commit together with recent commit context. Single commits can be atomic; extract the broader purpose, intent, constraints, and system-level knowledge only when warranted.",
+    "Apply an information-purity gate: do not create durable memory for formatting-only changes, generated files, lockfile churn, no-op/config noise, transient fixes with no reusable lesson, or commits that do not teach future agents anything meaningful.",
     `When substantial repo-local prose/API/guide/architecture documentation is needed, do not write it yourself; recommend using the technical doc writer skill at ${TECH_DOC_WRITER_SKILL_PATH}.`,
-    "Return concise Markdown with sections: Summary, Intent Across Recent Commits, System Knowledge, Documentation Impact, Repo Docs Follow-up, Evidence. Be conservative; do not overclaim.",
+    "If there is no durable knowledge worth preserving, return exactly: NO_DURABLE_FINDINGS.",
+    "Otherwise return concise Markdown with sections: Summary, Intent Across Recent Commits, System Knowledge, Documentation Impact, Repo Docs Follow-up, Evidence. Be conservative; do not overclaim.",
   ].join("\n");
   const message: UserMessage = {
     role: "user",
@@ -359,7 +972,7 @@ async function modelSummary(ctx: ExtensionContext, cfg: ArchivistConfig, input: 
   };
   const response = await complete(model, { systemPrompt: prompt, messages: [message] }, { apiKey: auth.apiKey, headers: auth.headers, signal: ctx.signal });
   if (response.stopReason === "aborted") return heuristicSummary(input);
-  const text = response.content.filter((c): c is { type: "text"; text: string } => c.type === "text").map(c => c.text).join("\n").trim();
+  const text = normalizeModelMarkdown(response.content.filter((c): c is { type: "text"; text: string } => c.type === "text").map(c => c.text).join("\n"));
   return text || heuristicSummary(input);
 }
 
@@ -368,12 +981,28 @@ async function collectCommit(cwd: string, commit: string, recentCount: number) {
   const message = await git(cwd, ["log", "-1", "--pretty=%B", sha]);
   const stats = await git(cwd, ["show", "--stat", "--name-status", "--format=fuller", sha]);
   const diff = await git(cwd, ["show", "--format=", "--find-renames", "--find-copies", sha]);
-  const filesRaw = await git(cwd, ["diff-tree", "--no-commit-id", "--name-only", "-r", sha]);
+  const filesRaw = await git(cwd, ["diff-tree", "--root", "--no-commit-id", "--name-only", "-r", sha]);
   const recent = await git(cwd, ["log", `-${Math.max(1, recentCount)}`, "--date=short", "--pretty=format:%h %ad %s", "--decorate"]);
   return { sha, message, stats, diff, files: filesRaw.split(/\r?\n/).filter(Boolean), recent };
 }
 
+function isHeuristicCommitSummary(summary: string): boolean {
+  return /heuristic fallback was used/i.test(summary)
+    || /could not obtain a dedicated-model synthesis/i.test(summary);
+}
+
+function hasDurableCommitKnowledge(summary: string): boolean {
+  const normalized = summary.trim().toLowerCase();
+  if (!normalized) return false;
+  if (normalized === "no_durable_findings" || normalized.startsWith("no_durable_findings\n")) return false;
+  if (/no durable (knowledge|findings|memory|learning)/i.test(summary)) return false;
+  if (/nothing durable (was )?(found|identified|detected)/i.test(summary)) return false;
+  if (isHeuristicCommitSummary(summary)) return false;
+  return true;
+}
+
 function writeMemory(cfg: ArchivistConfig, cwd: string, commit: string, summary: string, files: string[]) {
+  if (!hasDurableCommitKnowledge(summary)) return null;
   const root = obsidianMemoryPath(cfg);
   const evidenceDir = path.join(root, "wiki", "evidence");
   mkdirSync(evidenceDir, { recursive: true });
@@ -387,6 +1016,8 @@ function writeMemory(cfg: ArchivistConfig, cwd: string, commit: string, summary:
     `commit: ${commit}`,
     `created: ${nowIso()}`,
     `repo: ${path.basename(cwd)}`,
+    `model: ${cfg.model.provider}/${cfg.model.id}`,
+    "model_status: synthesized",
     "---",
     "",
     `# ${title}`,
@@ -395,10 +1026,16 @@ function writeMemory(cfg: ArchivistConfig, cwd: string, commit: string, summary:
     "",
   ].join("\n");
   writeFileSync(evidenceFile, note);
-  appendCatalogRow(root, {
+  triggerObsidianDocumentIngest(cfg, cwd, evidenceFile);
+
+  // Catalog lives in the project repo; references both repo files and Obsidian pages.
+  const relativeEvidencePath = path.relative(cwd, evidenceFile).replace(/\\/g, "/");
+  upsertCatalogRow(cwd, {
     id: `evidence.archivist-${commit.slice(0, 12)}`,
+    scope: "project",
+    project: path.basename(cwd),
     type: "evidence",
-    path: path.relative(root, evidenceFile).replace(/\\/g, "/"),
+    path: relativeEvidencePath,
     title,
     summary: `Archivist commit evidence for ${commit.slice(0, 12)}`,
     aliases: commit.slice(0, 12),
@@ -415,12 +1052,332 @@ function writeMemory(cfg: ArchivistConfig, cwd: string, commit: string, summary:
   mkdirSync(journalDir, { recursive: true });
   const journalFile = path.join(journalDir, `${today()}.md`);
   appendFileSync(journalFile, `\n## Archivist ${commit.slice(0, 12)} — ${path.basename(cwd)}\n\n${summary.trim()}\n\nEvidence: [[${path.basename(evidenceFile, ".md")}]]\n`);
+  triggerObsidianDocumentIngest(cfg, cwd, journalFile);
 
-  if (hasDocsImpact(files)) {
-    appendInboxNote(cfg, cwd, "Archivist docs follow-up", `Commit ${commit.slice(0, 12)} may require repo-local documentation review. See ${evidenceFile}.`);
+  return { evidenceFile, journalFile, id: `evidence.archivist-${commit.slice(0, 12)}`, title, summary: summary.trim(), relativeEvidencePath };
+}
+
+type CommitCluster = {
+  shas: string[];
+  recent: string;
+  files: string[];
+  stats: string;
+  diff: string;
+};
+
+async function collectCommitCluster(cwd: string, count: number): Promise<CommitCluster> {
+  const safeCount = Math.max(2, Math.min(50, count));
+  const shas = (await git(cwd, ["rev-list", `--max-count=${safeCount}`, "HEAD"])).split(/\r?\n/).filter(Boolean);
+  const range = shas.length > 1 ? `${shas[shas.length - 1]}^..HEAD` : "HEAD";
+  const recent = await git(cwd, ["log", `-${safeCount}`, "--date=short", "--pretty=format:%h %ad %s", "--decorate"]);
+  const stats = await git(cwd, ["show", "--stat", "--name-status", "--format=fuller", ...shas]).catch(() => recent);
+  const diff = await git(cwd, ["diff", "--find-renames", "--find-copies", range]).catch(() => "");
+  const filesRaw = await git(cwd, ["show", "--format=", "--name-only", ...shas]).catch(() => "");
+  const files = [...new Set(filesRaw.split(/\r?\n/).filter(Boolean))];
+  return { shas, recent, files, stats, diff };
+}
+
+async function modelClusterSummary(ctx: ExtensionContext, cfg: ArchivistConfig, cluster: CommitCluster) {
+  if (cfg.model.heuristicOnly) return "NO_DURABLE_FINDINGS";
+  const model = ctx.modelRegistry.find(cfg.model.provider, cfg.model.id);
+  if (!model) throw new Error(`Archivist model not found: ${cfg.model.provider}/${cfg.model.id}`);
+  const auth = await ctx.modelRegistry.getApiKeyAndHeaders(model);
+  if (!auth.ok || !auth.apiKey) throw new Error(auth.ok ? `No API key for ${model.provider}` : auth.error);
+  const prompt = [
+    "You are Archivist, Sherpa's write-side project memory steward.",
+    "Analyze this cluster of recent commits as one change narrative, not as isolated atomic commits.",
+    "Write durable memory only if the cluster reveals reusable system knowledge, a changed contract, an architectural decision, or documentation drift.",
+    "Skip pure internal refactor/test/catalog churn with exactly: NO_DURABLE_FINDINGS.",
+    "If useful, return concise Markdown with sections: Summary, Intent Across Commits, System Knowledge, Documentation Impact, Follow-up, Evidence.",
+  ].join("\n");
+  const message: UserMessage = { role: "user", timestamp: Date.now(), content: [{ type: "text", text: [
+    `Commits:\n${cluster.recent}`,
+    `Changed files:\n${cluster.files.join("\n")}`,
+    `Stats:\n${cluster.stats.slice(0, 12000)}`,
+    `Diff excerpt:\n${cluster.diff.slice(0, 30000)}`,
+  ].join("\n\n") }] };
+  const response = await complete(model, { systemPrompt: prompt, messages: [message] }, { apiKey: auth.apiKey, headers: auth.headers, signal: ctx.signal });
+  if (response.stopReason === "aborted") return "NO_DURABLE_FINDINGS";
+  return normalizeModelMarkdown(response.content.filter((c): c is { type: "text"; text: string } => c.type === "text").map((c) => c.text).join("\n"));
+}
+
+function writeClusterMemory(cfg: ArchivistConfig, cwd: string, cluster: CommitCluster, summary: string) {
+  if (!hasDurableCommitKnowledge(summary)) return null;
+  const root = obsidianMemoryPath(cfg);
+  const evidenceDir = path.join(root, "wiki", "evidence");
+  mkdirSync(evidenceDir, { recursive: true });
+  const head = cluster.shas[0]?.slice(0, 12) ?? "unknown";
+  const tail = cluster.shas[cluster.shas.length - 1]?.slice(0, 12) ?? head;
+  const title = `Commit cluster ${tail}..${head}`;
+  const evidenceFile = path.join(evidenceDir, `${slug(title)}.md`);
+  const note = ["---", `id: archivist-cluster-${tail}-${head}`, "type: evidence", "source: git-commit-cluster", `commits: ${cluster.shas.join("|")}`, `created: ${nowIso()}`, `repo: ${path.basename(cwd)}`, `model: ${cfg.model.provider}/${cfg.model.id}`, "model_status: synthesized", "---", "", `# ${title}`, "", summary.trim(), ""].join("\n");
+  writeFileSync(evidenceFile, note);
+  triggerObsidianDocumentIngest(cfg, cwd, evidenceFile);
+  const relativeEvidencePath = path.relative(cwd, evidenceFile).replace(/\\/g, "/");
+  const artifactId = `evidence.archivist-cluster-${tail}-${head}`;
+  upsertCatalogRow(cwd, { id: artifactId, scope: "project", project: path.basename(cwd), type: "evidence", path: relativeEvidencePath, title, summary: `Archivist commit-cluster evidence for ${tail}..${head}`, aliases: `${tail}|${head}`, tags: "archivist|git|commit-cluster", status: "active", confidence: "medium", updated: today(), based_on: cluster.shas.join("|"), routes: cluster.files.join("|"), keywords: cluster.files.map((file) => path.basename(file)).join("|") });
+  const journalFile = path.join(root, "journal", `${today()}.md`);
+  mkdirSync(path.dirname(journalFile), { recursive: true });
+  appendFileSync(journalFile, `\n## Archivist cluster ${tail}..${head} — ${path.basename(cwd)}\n\n${summary.trim()}\n\nEvidence: [[${path.basename(evidenceFile, ".md")}]]\n`);
+  triggerObsidianDocumentIngest(cfg, cwd, journalFile);
+  return { evidenceFile, journalFile, id: artifactId, title, summary: summary.trim(), relativeEvidencePath };
+}
+
+function stableMemoryId(prefix: string, value: string) {
+  return `${prefix}.${createHash("sha256").update(value).digest("hex").slice(0, 16)}`;
+}
+
+function sourceFileArtifactId(file: string) {
+  return `source-file.${file.replace(/[^A-Za-z0-9_.-]+/g, ".").replace(/^\.+|\.+$/g, "")}`;
+}
+
+async function writeDocumentChunks(store: MemoryApiStore, cfg: ArchivistConfig, artifact: MemoryArtifact, sourceText: string) {
+  void cfg;
+  const chunks = splitTextChunks(sourceText);
+  const embeddings = await requestEmbeddings(chunks);
+  const prepared = prepareDocumentChunks({ artifact, sourceText, embeddings, createdAt: nowIso() });
+  for (const chunk of prepared.chunks) await store.writeChunk?.(chunk).catch(() => undefined);
+  for (const relation of prepared.relations) await store.writeRelation(relation).catch(() => undefined);
+  return { chunks: chunks.length, embeddings: embeddings.length };
+}
+
+function extractGraphEntities(text: string): string[] {
+  const candidates = new Set<string>();
+  for (const match of text.matchAll(/\b[A-Z][A-Za-z0-9]*(?:[A-Z][A-Za-z0-9]*)+\b/g)) candidates.add(match[0]);
+  for (const match of text.matchAll(/`([^`]{3,80})`/g)) candidates.add(match[1]!.trim());
+  for (const match of text.matchAll(/\b(?:[a-z0-9]+[-_/.:]){1,}[a-z0-9_.-]+\b/gi)) candidates.add(match[0]);
+  return [...candidates]
+    .map((item) => item.replace(/^repo:\/\//, "").trim())
+    .filter((item) => item.length >= 3 && item.length <= 80)
+    .filter((item) => !/^(summary|evidence|documentation|intent|system|commit)$/i.test(item))
+    .slice(0, 16);
+}
+
+async function writeEntityMentions(store: MemoryApiStore, project: string, fromId: string, text: string, source: string, now: string) {
+  for (const entity of extractGraphEntities(text)) {
+    const entityId = stableMemoryId("entity", entity.toLowerCase());
+    await store.writeArtifact({
+      id: entityId,
+      scope: "project",
+      project,
+      type: "entity",
+      title: entity,
+      summary: `Entity mentioned in Archivist memory: ${entity}`,
+      text: entity,
+      confidence: "medium",
+      status: "active",
+      tags: ["entity"],
+      aliases: [entity],
+      keywords: [entity],
+      createdAt: now,
+      updatedAt: now,
+    }).catch(() => undefined);
+    await store.writeRelation({ from: fromId, relation: "mentions", to: entityId, confidence: "medium", source, createdAt: now }).catch(() => undefined);
+  }
+}
+
+function extractSourceGroundedClaims(summary: string): string[] {
+  const lines = summary.split(/\r?\n/).map((line) => line.trim()).filter(Boolean);
+  const claims: string[] = [];
+  for (const line of lines) {
+    const cleaned = line.replace(/^[-*]\s+/, "").replace(/^#+\s+/, "").trim();
+    if (cleaned.length < 35 || cleaned.length > 260) continue;
+    if (/^(summary|evidence|documentation impact|repo docs follow-up|system knowledge|intent across recent commits)$/i.test(cleaned)) continue;
+    if (/^(no durable|no repo|none\b|n\/a\b|heuristic fallback)/i.test(cleaned)) continue;
+    if (!/[.。]$/.test(cleaned) && !/\b(is|are|adds|uses|keeps|moves|creates|updates|requires|depends|routes|stores|writes|reads)\b/i.test(cleaned)) continue;
+    claims.push(cleaned);
+    if (claims.length >= 8) break;
+  }
+  return [...new Set(claims)];
+}
+
+function normalizeModelMarkdown(text: string) {
+  const trimmed = text.trim();
+  const fenced = trimmed.match(/^```(?:markdown|md)?\s*\n([\s\S]*?)\n```\s*$/i);
+  return (fenced?.[1] ?? trimmed).trim();
+}
+
+function titleFromMarkdown(text: string, fallback: string) {
+  return text.match(/^#\s+(.+)$/m)?.[1]?.trim().slice(0, 160) || fallback;
+}
+
+function researchAreaFromPath(file: string) {
+  const parts = file.replace(/\\/g, "/").split("/");
+  const idx = parts.lastIndexOf("research");
+  return idx >= 0 ? parts[idx + 1] : undefined;
+}
+
+async function mirrorSourceDocumentToMemoryApi(cfg: ArchivistConfig, cwd: string, file: string) {
+  const store = archivistMemoryStore(cfg);
+  if (!store) return { mirrored: false, reason: "memory API disabled" };
+  const resolved = path.isAbsolute(file) ? file : path.resolve(cwd, file);
+  if (!existsSync(resolved) || !statSync(resolved).isFile()) return { mirrored: false, reason: `Source file not found: ${file}` };
+  const raw = readFileSync(resolved, "utf8");
+  const now = nowIso();
+  const area = researchAreaFromPath(resolved);
+  const scope = area ? "research" as const : "project" as const;
+  const project = scope === "project" ? path.basename(cwd) : undefined;
+  const rel = path.relative(cwd, resolved).replace(/\\/g, "/");
+  const artifactId = stableMemoryId("source", resolved);
+  const title = titleFromMarkdown(raw, path.basename(resolved));
+  const artifact: MemoryArtifact = {
+    id: artifactId,
+    scope,
+    project,
+    area,
+    category: area === "ai" ? "agent-memory" : undefined,
+    type: "source",
+    title,
+    summary: `Source document mirrored by Archivist: ${title}`,
+    text: raw.slice(0, 24000),
+    sourcePath: rel.startsWith("..") ? resolved : rel,
+    sourceHash: createHash("sha256").update(raw).digest("hex"),
+    confidence: "medium",
+    status: "active",
+    tags: ["archivist", "source", area ?? "project"],
+    aliases: [title, path.basename(resolved)],
+    routes: [title, path.basename(resolved)],
+    keywords: [title, path.basename(resolved), ...(area ? [area] : [])],
+    createdAt: now,
+    updatedAt: now,
+  };
+  await store.writeArtifact(artifact);
+  const chunkStats = await writeDocumentChunks(store, cfg, artifact, raw);
+  await writeEntityMentions(store, project ?? path.basename(cwd), artifactId, raw.slice(0, 12000), resolved, now);
+  let claims = 0;
+  for (const claim of extractSourceGroundedClaims(raw).slice(0, 12)) {
+    const claimId = stableMemoryId("claim", `${resolved}\n${claim}`);
+    await store.writeArtifact({
+      id: claimId,
+      scope,
+      project,
+      area,
+      category: area === "ai" ? "agent-memory" : undefined,
+      type: "claim",
+      title: claim.slice(0, 100),
+      summary: claim,
+      text: claim,
+      sourcePath: rel.startsWith("..") ? resolved : rel,
+      sourceHash: createHash("sha256").update(raw).digest("hex"),
+      confidence: "medium",
+      status: "active",
+      tags: ["claim", "archivist", area ?? "project"],
+      aliases: [claim.slice(0, 80)],
+      keywords: claim.split(/\W+/).filter((word) => word.length > 4).slice(0, 16),
+      createdAt: now,
+      updatedAt: now,
+    }).catch(() => undefined);
+    await store.writeRelation({ from: artifactId, relation: "supports", to: claimId, confidence: "medium", source: resolved, createdAt: now }).catch(() => undefined);
+    await writeEntityMentions(store, project ?? path.basename(cwd), claimId, claim, resolved, now);
+    claims++;
+  }
+  return { mirrored: true, artifactId, title, claims, ...chunkStats };
+}
+
+async function mirrorCommitEvidenceToMemoryApi(cfg: ArchivistConfig, cwd: string, written: NonNullable<ReturnType<typeof writeMemory>>, commit: string, files: string[]) {
+  const store = archivistMemoryStore(cfg);
+  if (!store) return;
+  const project = path.basename(cwd);
+  const now = nowIso();
+  await store.writeArtifact({
+    id: written.id,
+    scope: "project",
+    project,
+    type: "evidence",
+    title: written.title,
+    summary: `Archivist commit evidence for ${commit.slice(0, 12)}`,
+    text: written.summary,
+    sourcePath: written.relativeEvidencePath,
+    sourceHash: commit,
+    confidence: "medium",
+    status: "active",
+    tags: ["archivist", "git", "commit"],
+    aliases: [commit.slice(0, 12)],
+    routes: files,
+    keywords: files.map((file) => path.basename(file)),
+    createdAt: now,
+    updatedAt: now,
+  }).catch(() => undefined);
+
+  await writeEntityMentions(store, project, written.id, written.summary, commit, now);
+
+  for (const file of files.slice(0, 80)) {
+    const fileId = sourceFileArtifactId(file);
+    await store.writeArtifact({
+      id: fileId,
+      scope: "project",
+      project,
+      type: "source-file",
+      title: file,
+      summary: `Source file touched by Archivist-ingested commits: ${file}`,
+      text: [file, path.basename(file), path.dirname(file)].join("\n"),
+      sourcePath: `repo://${file}`,
+      confidence: "high",
+      status: "active",
+      tags: ["source-file", "repo"],
+      aliases: [file, path.basename(file)],
+      routes: [file],
+      keywords: [file, path.basename(file), path.dirname(file)],
+      createdAt: now,
+      updatedAt: now,
+    }).catch(() => undefined);
+    await store.writeRelation({
+      from: written.id,
+      relation: "based_on",
+      to: fileId,
+      confidence: "high",
+      source: commit,
+      createdAt: now,
+    }).catch(() => undefined);
   }
 
-  return { evidenceFile, journalFile };
+  if (cfg.researchLinks.sageSourceId && /\b(SAGE|GraphRAG|agent memory|graph memory|memory API)\b/i.test(written.summary)) {
+    await store.writeRelation({
+      from: written.id,
+      relation: "applies_research",
+      to: cfg.researchLinks.sageSourceId,
+      confidence: "medium",
+      source: commit,
+      createdAt: now,
+    }).catch(() => undefined);
+  }
+
+  for (const claim of extractSourceGroundedClaims(written.summary)) {
+    const claimId = stableMemoryId("claim", `${commit}\n${claim}`);
+    await store.writeArtifact({
+      id: claimId,
+      scope: "project",
+      project,
+      type: "claim",
+      title: claim.slice(0, 100),
+      summary: claim,
+      text: claim,
+      sourcePath: written.relativeEvidencePath,
+      sourceHash: commit,
+      confidence: "medium",
+      status: "active",
+      tags: ["claim", "archivist", "git"],
+      aliases: [claim.slice(0, 80)],
+      routes: files,
+      keywords: [...files.map((file) => path.basename(file)), ...claim.split(/\W+/).filter((word) => word.length > 4).slice(0, 12)],
+      createdAt: now,
+      updatedAt: now,
+    }).catch(() => undefined);
+    await store.writeRelation({
+      from: written.id,
+      relation: "supports",
+      to: claimId,
+      confidence: "medium",
+      source: commit,
+      createdAt: now,
+    }).catch(() => undefined);
+    await writeEntityMentions(store, project, claimId, claim, commit, now);
+  }
+}
+
+function triggerCommitEvidenceMirror(cfg: ArchivistConfig, cwd: string, written: NonNullable<ReturnType<typeof writeMemory>>, commit: string, files: string[]) {
+  void mirrorCommitEvidenceToMemoryApi(cfg, cwd, written, commit, files)
+    .catch((error) => recordMemoryIngestFailure(cwd, written.evidenceFile, error));
 }
 
 const ingestSchema = Type.Object({
@@ -440,6 +1397,111 @@ const preserveSchema = Type.Object({
   storage: Type.Optional(Type.String()),
 });
 type PreserveParams = Static<typeof preserveSchema>;
+
+type PreserveWriteResult = {
+  destination: string;
+  file?: string;
+  relativePath?: string;
+  catalogId?: string;
+  indexed?: boolean;
+  indexMode?: string;
+  indexWarning?: string;
+};
+
+function semanticPreserveType(type: string) {
+  if (type === "pattern" || type === "automation") return { folder: "procedures", pageType: "procedure" };
+  if (type === "process") return { folder: "decisions", pageType: "decision" };
+  return { folder: "concepts", pageType: "concept" };
+}
+
+function yamlScalar(value: unknown): string {
+  if (Array.isArray(value)) return `[${value.map((item) => JSON.stringify(String(item))).join(", ")}]`;
+  return JSON.stringify(String(value ?? ""));
+}
+
+function formatPreserveNote(params: PreserveParams, pageType: string): string {
+  const frontmatter: Record<string, unknown> = {
+    id: params.refId,
+    type: pageType,
+    importance: params.importance || "medium",
+    tags: params.tags || [],
+    source: "archivist_preserve",
+    created: nowIso(),
+  };
+  return [
+    "---",
+    ...Object.entries(frontmatter).map(([key, value]) => `${key}: ${yamlScalar(value)}`),
+    "---",
+    "",
+    `# ${params.title}`,
+    "",
+    params.summary,
+    "",
+    `Reflect ID: ${params.refId}`,
+    "",
+  ].join("\n");
+}
+
+async function writeAndIndexPreservedReflection(cfg: ArchivistConfig, cwd: string, params: PreserveParams, destination: string): Promise<PreserveWriteResult> {
+  if (destination !== "obsidian") {
+    throw new Error(`archivist_preserve cannot verify durable indexed writes for destination: ${destination}`);
+  }
+
+  const semantic = semanticPreserveType(params.type);
+  const dir = path.join(obsidianMemoryPath(cfg), "wiki", semantic.folder);
+  mkdirSync(dir, { recursive: true });
+  const target = path.join(dir, `${slug(params.title || params.refId)}.md`);
+  const note = formatPreserveNote(params, semantic.pageType);
+  writeFileSync(target, note);
+
+  if (!existsSync(target) || !readFileSync(target, "utf8").includes(params.refId)) {
+    throw new Error(`preservation verification failed: note was not written with refId ${params.refId}`);
+  }
+
+  const relativePath = path.relative(cwd, target).replace(/\\/g, "/");
+  const catalogId = `reflect.${params.refId}`;
+  upsertCatalogRow(cwd, {
+    id: catalogId,
+    scope: "project",
+    project: path.basename(cwd),
+    type: semantic.pageType,
+    path: relativePath,
+    title: params.title,
+    summary: params.summary.slice(0, 240),
+    aliases: params.refId,
+    tags: Array.isArray(params.tags) ? params.tags.join("|") : "reflect",
+    status: "active",
+    confidence: params.importance || "medium",
+    updated: today(),
+    based_on: params.refId,
+    routes: [params.title, ...(params.tags || [])].filter(Boolean).join("|"),
+    keywords: [params.refId, params.type || "", params.importance || ""].filter(Boolean).join("|"),
+  });
+
+  try {
+    const ingest = await ingestObsidianDocumentToMemoryApi(cfg, cwd, target);
+    return {
+      destination,
+      file: target,
+      relativePath,
+      catalogId,
+      indexed: Boolean((ingest as any)?.ingested),
+      indexMode: (ingest as any)?.mode,
+      indexWarning: (ingest as any)?.ingested ? undefined : ((ingest as any)?.reason || "Inquirer ingest did not report success"),
+    };
+  } catch (error) {
+    recordMemoryIngestFailure(cwd, target, error);
+    return {
+      destination,
+      file: target,
+      relativePath,
+      catalogId,
+      indexed: false,
+      indexWarning: error instanceof Error ? error.message : String(error),
+    };
+  }
+}
+
 const distillSchema = Type.Object({
   trigger: Type.String(),
   task: Type.String(),
@@ -458,60 +1520,65 @@ type RunAutomationParams = Static<typeof runAutomationSchema>;
 export default function (pi: ExtensionAPI) {
   let state: ArchivistState = createArchivistState();
 
-  pi.on("agent_end", async (event, ctx) => {
+  // Deliberately do not run Archivist maintenance on every agent/task end.
+  // Archivist is session-level/commit-hook maintenance, not part of the main
+  // agent's per-task critical path.
+  pi.on("agent_end", async (_event, _ctx) => {});
+
+  // Session compaction is a good low-interference point for Archivist:
+  // preserve the compacted context and run documentation maintenance
+  // asynchronously without blocking or steering the main agent.
+  // Shared handler for session lifecycle events (compact + shutdown).
+  function handleSessionEvent(reason: string, rawText: string, ctx: ExtensionContext) {
     const cfg = loadConfig(ctx.cwd);
     if (!cfg.enabled) return;
-    const raw = stringifyForAutoMemory(event.messages ?? ctx.sessionManager.getEntries().slice(-12));
-    const result = writeAutoMemoryArtifact(state.autoMemory, autoMemoryConfig(cfg, ctx.cwd), "agent_end", raw);
-    if (result.written && result.candidates.length && ctx.hasUI) ctx.ui.setStatus("archivist", `📚 memory: ${result.candidates.length} candidate(s)`);
+    const runtime = { modelRegistry: ctx.modelRegistry, signal: ctx.signal };
+    const notify = createSafeNotifier(ctx);
 
-    const automationCandidates = updateAutomationCandidates(state.automation, raw, 3, ctx.cwd);
-    for (const candidate of automationCandidates) {
-      appendInboxNote(cfg, ctx.cwd, "Automation candidate", `${candidate.markdown}\n\nPolicy source: Sherpa AUTOMATION.md, now maintained by Archivist.`);
-    }
-    if (automationCandidates.length && ctx.hasUI) ctx.ui.notify(`Archivist detected ${automationCandidates.length} automation candidate(s)`, "info");
+    // Fire-and-forget model-based session analysis.
+    void (async () => {
+      const findings = await modelSessionAnalysis(runtime, cfg, { reason, rawText });
+      if (findings && findings !== "NO_DURABLE_FINDINGS") {
+        const written = writeSessionFindings(cfg, ctx.cwd, reason, findings);
+        if (written) {
+          triggerObsidianDocumentIngest(cfg, ctx.cwd, written);
+          appendDocumentationJobLog(cfg, ctx.cwd, { kind: "session-findings", status: "written", trigger: reason, output: written, model: `${cfg.model.provider}/${cfg.model.id}` });
+          notify?.(`Archivist extracted session findings → journal`, "success");
+        }
+      }
+    })().catch(() => { /* silently fail — session analysis is best-effort */ });
 
-    const outcome = classifyTaskOutcome(raw);
-    const status = await gitChanged(ctx.cwd);
-    const changedFiles = parseGitStatusFiles(status);
-    const lifecycleHash = hashAutoMemory(`archivist-lifecycle\n${outcome.outcome}\n${changedFiles.sort().join("\n")}`);
-    if (!state.lifecycleHashes.includes(lifecycleHash) && (changedFiles.length || outcome.outcome !== "unknown")) {
-      const verification = suggestVerificationCommands(changedFiles);
-      appendJournalNote(cfg, ctx.cwd, "Task lifecycle summary", [
-        `Outcome: ${outcome.outcome}`,
-        `Reason: ${outcome.reason}`,
-        "",
-        changedFiles.length ? "Changed files:" : "Changed files: none detected",
-        ...changedFiles.slice(0, 30).map((file) => `- ${file}`),
-        "",
-        verification.commands.length ? "Suggested verification:" : "Suggested verification: none",
-        ...verification.commands.map((item) => `- \`${item.command}\` — ${item.reason}`),
-        verification.docsReview ? "- Documentation review recommended." : "- Documentation review not required by heuristic.",
-        verification.routesReview ? "- routes.csv review recommended." : "- routes.csv review not required by heuristic.",
-      ].join("\n"));
-      state.lifecycleHashes = [...state.lifecycleHashes.slice(-49), lifecycleHash];
-    }
-
-
-    const audit = await auditDocumentationDrift(state, cfg, ctx.cwd);
-    if (audit.needed) {
-      if (ctx.hasUI) ctx.ui.notify("Archivist detected possible documentation drift", "warning");
-      pi.sendMessage({ customType: "archivist-doc-audit", content: documentationAuditMessage(audit), display: true, details: audit }, { triggerTurn: true, deliverAs: "steer" });
-    }
-  });
+    // Documentation drift audit.
+    const cwdForDocsAudit = ctx.cwd;
+    void (async () => {
+      const audit = await auditDocumentationDrift(state, cfg, cwdForDocsAudit, runtime);
+      if (!audit.needed) return;
+      notify?.(`Archivist ${reason} documentation maintenance started asynchronously`, "info");
+      const handled = await completeDocumentationDrift(runtime, cfg, cwdForDocsAudit, audit);
+      const applied = handled.applied?.length ? ` Updated: ${[...new Set(handled.applied)].join(", ")}` : "";
+      const suffix = handled.handled ? applied || " No repo-doc update needed." : " Handoff written to Archivist inbox.";
+      notify?.(`Archivist ${reason} documentation maintenance complete.${suffix}`, handled.handled ? "success" : "warning");
+      sendArchivistMessage(pi, {
+        customType: "archivist-doc-maintenance-complete",
+        content: documentationMaintenanceReport(handled),
+        display: true,
+        details: handled,
+      });
+    })().catch((error) => {
+      const message = error instanceof Error ? error.message : String(error);
+      appendInboxNote(cfg, cwdForDocsAudit, "Documentation drift async failure", `Archivist ${reason} asynchronous documentation maintenance failed.\n\n${message}`);
+      notify?.(`Archivist ${reason} documentation maintenance failed: ${message}`, "error");
+    });
+  }
 
   pi.on("session_compact", async (event, ctx) => {
-    const cfg = loadConfig(ctx.cwd);
-    if (!cfg.enabled) return;
     const raw = stringifyForAutoMemory(event.compactionEntry ?? ctx.sessionManager.getEntries().slice(-20));
-    writeAutoMemoryArtifact(state.autoMemory, autoMemoryConfig(cfg, ctx.cwd), "session_compact", raw);
+    handleSessionEvent("session_compact", raw, ctx);
   });
 
   pi.on("session_shutdown", async (event, ctx) => {
-    const cfg = loadConfig(ctx.cwd);
-    if (!cfg.enabled) return;
     const raw = stringifyForAutoMemory({ reason: event.reason, recent: ctx.sessionManager.getEntries().slice(-20) });
-    writeAutoMemoryArtifact(state.autoMemory, autoMemoryConfig(cfg, ctx.cwd), `session_shutdown:${event.reason}`, raw);
+    handleSessionEvent(`session_shutdown:${event.reason}`, raw, ctx);
   });
 
   pi.registerTool({
@@ -527,14 +1594,54 @@ export default function (pi: ExtensionAPI) {
       onUpdate?.({ content: [{ type: "text", text: "Archivist collecting git commit context…" }] });
       const commit = await collectCommit(ctx.cwd, params.commit || "HEAD", params.recentCommitCount || cfg.commitHook.recentCommitCount);
       onUpdate?.({ content: [{ type: "text", text: `Archivist analyzing ${commit.sha.slice(0, 12)} with ${cfg.model.provider}/${cfg.model.id}…` }] });
-      const catalogRows = relevantCatalogRows(obsidianMemoryPath(cfg), [commit.message, commit.files.join("\n"), commit.recent].join("\n"));
+      const catalogRows = catalogMatches(ctx.cwd, [commit.message, commit.files.join("\n"), commit.recent].join("\n"), { limit: 12, threshold: 0.04 }).map((m) => m.row);
       const summary = await modelSummary(ctx, cfg, { commit: commit.sha, message: commit.message, stats: commit.stats, diff: commit.diff, files: commit.files, recent: commit.recent, catalogRows });
-      if (params.dryRun) return { content: [{ type: "text", text: summary }], details: { dryRun: true, commit: commit.sha, model: cfg.model } };
-      const written = writeMemory(cfg, ctx.cwd, commit.sha, summary, commit.files);
-      return { content: [{ type: "text", text: [`Archivist ingested ${commit.sha.slice(0, 12)}`, `Model: ${cfg.model.provider}/${cfg.model.id}`, `Evidence: ${written.evidenceFile}`, `Journal: ${written.journalFile}`].join("\n") }], details: { commit: commit.sha, ...written } };
+      const heuristicFallback = isHeuristicCommitSummary(summary);
+      if (params.dryRun) {
+        appendDocumentationJobLog(cfg, ctx.cwd, { kind: "commit-ingest", status: heuristicFallback ? "fallback" : "dry-run", trigger: "archivist_ingest", commit: commit.sha, files: commit.files, model: `${cfg.model.provider}/${cfg.model.id}` });
+        return { content: [{ type: "text", text: summary }], details: { dryRun: true, commit: commit.sha, model: cfg.model, heuristicFallback } };
+      }
+      const written = heuristicFallback ? null : writeMemory(cfg, ctx.cwd, commit.sha, summary, commit.files);
+      if (!written) {
+        const reason = heuristicFallback ? "dedicated model unavailable or aborted; heuristic summary not persisted" : "no durable knowledge passed information-purity gate";
+        appendDocumentationJobLog(cfg, ctx.cwd, { kind: "commit-ingest", status: heuristicFallback ? "fallback" : "skipped", trigger: "archivist_ingest", commit: commit.sha, files: commit.files, reason, model: `${cfg.model.provider}/${cfg.model.id}` });
+        return { content: [{ type: "text", text: `Archivist skipped ${commit.sha.slice(0, 12)} — ${reason}.` }], details: { commit: commit.sha, skipped: true, heuristicFallback } };
+      }
+      appendDocumentationJobLog(cfg, ctx.cwd, { kind: "commit-ingest", status: "written", trigger: "archivist_ingest", commit: commit.sha, files: commit.files, evidenceFile: written.evidenceFile, journalFile: written.journalFile, catalogId: written.id, model: `${cfg.model.provider}/${cfg.model.id}`, modelStatus: "synthesized" });
+      triggerCommitEvidenceMirror(cfg, ctx.cwd, written, commit.sha, commit.files);
+      return { content: [{ type: "text", text: [`Archivist ingested ${commit.sha.slice(0, 12)}`, `Model: ${cfg.model.provider}/${cfg.model.id}`, `Evidence: ${written.evidenceFile}`, `Journal: ${written.journalFile}`, `Inquirer ingest: queued asynchronously`].join("\n") }], details: { commit: commit.sha, ...written, inquirerIngestQueued: true } };
     },
   });
 
+  pi.registerCommand("archivist:cluster", { description: "Synthesize recent commits as one Archivist evidence cluster. Usage: /archivist:cluster [count] [dry-run]", handler: async (args, ctx) => {
+    const cfg = loadConfig(ctx.cwd);
+    if (!cfg.enabled) { ctx.ui.notify("Archivist is disabled.", "warning"); return; }
+    const tokens = (args ?? "").trim().split(/\s+/).filter(Boolean);
+    const count = Math.max(2, Math.min(50, Number(tokens.find((token) => /^\d+$/.test(token))) || cfg.commitHook.recentCommitCount || 12));
+    const dryRun = tokens.includes("dry-run") || tokens.includes("--dry-run");
+    try {
+      ctx.ui.notify(`Archivist cluster synthesis running for last ${count} commits…`, "info");
+      const cluster = await collectCommitCluster(ctx.cwd, count);
+      const summary = await modelClusterSummary(ctx, cfg, cluster);
+      if (dryRun) {
+        appendDocumentationJobLog(cfg, ctx.cwd, { kind: "commit-cluster", status: "dry-run", trigger: "archivist:cluster", commits: cluster.shas, files: cluster.files, model: `${cfg.model.provider}/${cfg.model.id}` });
+        ctx.ui.notify(summary.slice(0, 4000), "info");
+        return;
+      }
+      const written = writeClusterMemory(cfg, ctx.cwd, cluster, summary);
+      if (!written) {
+        appendDocumentationJobLog(cfg, ctx.cwd, { kind: "commit-cluster", status: "skipped", trigger: "archivist:cluster", commits: cluster.shas, files: cluster.files, reason: "no durable knowledge passed information-purity gate", model: `${cfg.model.provider}/${cfg.model.id}` });
+        ctx.ui.notify("Archivist cluster skipped — no durable knowledge passed the information-purity gate.", "info");
+        return;
+      }
+      appendDocumentationJobLog(cfg, ctx.cwd, { kind: "commit-cluster", status: "written", trigger: "archivist:cluster", commits: cluster.shas, files: cluster.files, evidenceFile: written.evidenceFile, journalFile: written.journalFile, catalogId: written.id, model: `${cfg.model.provider}/${cfg.model.id}`, modelStatus: "synthesized" });
+      ctx.ui.notify(`Archivist cluster written: ${written.evidenceFile}`, "success");
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      appendDocumentationJobLog(cfg, ctx.cwd, { kind: "commit-cluster", status: "failed", trigger: "archivist:cluster", error: message, model: `${cfg.model.provider}/${cfg.model.id}` });
+      ctx.ui.notify(`Archivist cluster synthesis failed: ${message}`, "error");
+    }
+  }});
 
   pi.registerTool({
     name: "archivist_preserve",
@@ -545,12 +1652,39 @@ export default function (pi: ExtensionAPI) {
       const cfg = loadConfig(ctx.cwd);
       const decision = evaluatePersistence({ type: params.type, title: params.title, summary: params.summary, importance: params.importance, tags: params.tags });
       if (decision.decision === "discard") {
+        appendDocumentationJobLog(cfg, ctx.cwd, { kind: "reflection-preserve", status: "discarded", trigger: "archivist_preserve", refId: params.refId, title: params.title, reason: decision.reason, confidence: decision.confidence });
         return { content: [{ type: "text", text: [`🚫 Discarded: "${params.title}"`, "", `Reason: ${decision.reason}`, `Confidence: ${decision.confidence}`].join("\n") }], details: { decision: "discard", reason: decision.reason, confidence: decision.confidence } };
       }
       const dest = params.storage && params.storage !== "auto" ? params.storage : decision.destination;
-      if (dest === "none") return { content: [{ type: "text", text: `⏭ Skipped: "${params.title}" — not worth persisting` }], details: { decision: "discard", reason: decision.reason, refId: params.refId } };
-      const syncResult = await syncReflectMemory(memoryPaths(cfg, ctx.cwd), { refId: params.refId, destination: dest });
-      return { content: [{ type: "text", text: [`✅ Persisted: "${params.title}"`, "", `Destination: ${dest}`, `Confidence: ${decision.confidence}`, "", `Reason: ${decision.reason}`, "", syncResult].join("\n") }], details: { decision: "persist", destination: dest, refId: params.refId, confidence: decision.confidence } };
+      if (dest === "none") {
+        appendDocumentationJobLog(cfg, ctx.cwd, { kind: "reflection-preserve", status: "skipped", trigger: "archivist_preserve", refId: params.refId, title: params.title, reason: decision.reason, confidence: decision.confidence });
+        return { content: [{ type: "text", text: `⏭ Skipped: "${params.title}" — not worth persisting` }], details: { decision: "discard", reason: decision.reason, refId: params.refId } };
+      }
+
+      let writeResult: PreserveWriteResult;
+      try {
+        writeResult = await writeAndIndexPreservedReflection(cfg, ctx.cwd, params, dest);
+      } catch (error) {
+        const message = error instanceof Error ? error.message : String(error);
+        appendDocumentationJobLog(cfg, ctx.cwd, { kind: "reflection-preserve", status: "failed", trigger: "archivist_preserve", refId: params.refId, title: params.title, destination: dest, reason: message, confidence: decision.confidence });
+        return { content: [{ type: "text", text: [`❌ Not preserved: "${params.title}"`, "", message].join("\n") }], details: { decision: "error", destination: dest, refId: params.refId, error: message } };
+      }
+
+      const status = writeResult.indexed ? "persisted_indexed" : "persisted_index_pending";
+      appendDocumentationJobLog(cfg, ctx.cwd, { kind: "reflection-preserve", status, trigger: "archivist_preserve", refId: params.refId, title: params.title, destination: dest, confidence: decision.confidence, file: writeResult.file, indexed: writeResult.indexed, indexWarning: writeResult.indexWarning });
+      const header = writeResult.indexed ? "✅ Preserved and indexed" : "⚠️ Preserved, but Inquirer indexing is not confirmed";
+      return { content: [{ type: "text", text: [
+        `${header}: "${params.title}"`,
+        "",
+        `Destination: ${dest}`,
+        `Confidence: ${decision.confidence}`,
+        writeResult.file ? `File: ${writeResult.file}` : undefined,
+        writeResult.file ? `Obsidian URI: obsidian://open?path=${encodeURIComponent(writeResult.file)}` : undefined,
+        writeResult.catalogId ? `Catalog ID: ${writeResult.catalogId}` : undefined,
+        writeResult.indexed ? `Inquirer: indexed${writeResult.indexMode ? ` (${writeResult.indexMode})` : ""}` : `Inquirer: not confirmed${writeResult.indexWarning ? ` — ${writeResult.indexWarning}` : ""}`,
+        "",
+        `Reason: ${decision.reason}`,
+      ].filter(Boolean).join("\n") }], details: { decision: "persist", destination: dest, refId: params.refId, confidence: decision.confidence, ...writeResult } };
     },
   });
 
@@ -562,10 +1696,15 @@ export default function (pi: ExtensionAPI) {
     async execute(_toolCallId, params: DistillParams, _signal, _onUpdate, ctx) {
       const cfg = loadConfig(ctx.cwd);
       const distill = writeDistilledSkill({ trigger: params.trigger, task: params.task, outcome: params.outcome, context: params.context, domain: params.domain, targetPath: params.targetPath }, ctx.cwd, obsidianMemoryPath(cfg));
-      appendCatalogRow(obsidianMemoryPath(cfg), {
-        id: `procedure.${distill.slug}`,
+      triggerObsidianDocumentIngest(cfg, ctx.cwd, distill.skillPath);
+      const relativeSkillPath = path.relative(ctx.cwd, distill.skillPath).replace(/\\/g, "/");
+      const artifactId = `procedure.${distill.slug}`;
+      upsertCatalogRow(ctx.cwd, {
+        id: artifactId,
+        scope: "project",
+        project: path.basename(ctx.cwd),
         type: "procedure",
-        path: path.relative(obsidianMemoryPath(cfg), distill.skillPath).replace(/\\/g, "/"),
+        path: relativeSkillPath,
         title: params.task.slice(0, 100),
         summary: params.outcome.slice(0, 180),
         aliases: distill.slug,
@@ -575,7 +1714,53 @@ export default function (pi: ExtensionAPI) {
         updated: today(),
         keywords: [params.task, params.domain ?? "general"].join("|"),
       });
-      return { content: [{ type: "text", text: [`🧪 Distilled: ${params.task}`, "", `Skill: ${distill.skillPath}`, `Scope: ${distill.destination}`].join("\n") }], details: { slug: distill.slug, skillPath: distill.skillPath, destination: distill.destination } };
+      const store = archivistMemoryStore(cfg);
+      if (store) void (async () => {
+        const now = nowIso();
+        await store.writeArtifact({
+          id: artifactId,
+          scope: "project",
+          project: path.basename(ctx.cwd),
+          type: "procedure",
+          category: params.domain,
+          title: params.task.slice(0, 100),
+          summary: params.outcome.slice(0, 180),
+          text: [params.trigger, params.task, params.outcome, params.context].filter(Boolean).join("\n\n"),
+          sourcePath: relativeSkillPath,
+          confidence: "medium",
+          status: "active",
+          tags: ["archivist", "distillation", params.domain ?? "general"],
+          aliases: [distill.slug],
+          keywords: [params.task, params.domain ?? "general"],
+          createdAt: now,
+          updatedAt: now,
+        });
+        if (params.targetPath) {
+          const fileId = sourceFileArtifactId(params.targetPath);
+          await store.writeArtifact({
+            id: fileId,
+            scope: "project",
+            project: path.basename(ctx.cwd),
+            type: "source-file",
+            title: params.targetPath,
+            summary: `Source file associated with distilled procedure: ${params.targetPath}`,
+            text: [params.targetPath, path.basename(params.targetPath), path.dirname(params.targetPath)].join("\n"),
+            sourcePath: `repo://${params.targetPath}`,
+            confidence: "high",
+            status: "active",
+            tags: ["source-file", "repo"],
+            aliases: [params.targetPath, path.basename(params.targetPath)],
+            routes: [params.targetPath],
+            keywords: [params.targetPath, path.basename(params.targetPath), path.dirname(params.targetPath)],
+            createdAt: now,
+            updatedAt: now,
+          });
+          await store.writeRelation({ from: artifactId, relation: "implements", to: fileId, confidence: "medium", source: relativeSkillPath, createdAt: now });
+        }
+        await writeEntityMentions(store, path.basename(ctx.cwd), artifactId, [params.trigger, params.task, params.outcome, params.context].filter(Boolean).join("\n\n"), relativeSkillPath, now);
+      })().catch((error) => recordMemoryIngestFailure(ctx.cwd, distill.skillPath, error));
+      appendDocumentationJobLog(cfg, ctx.cwd, { kind: "distillation", status: "written", trigger: "archivist_distill", task: params.task, outcome: params.outcome, skillPath: distill.skillPath, destination: distill.destination, catalogId: artifactId });
+      return { content: [{ type: "text", text: [`🧪 Distilled: ${params.task}`, "", `Skill: ${distill.skillPath}`, `Scope: ${distill.destination}`, `Inquirer ingest: queued asynchronously`].join("\n") }], details: { slug: distill.slug, skillPath: distill.skillPath, destination: distill.destination, inquirerIngestQueued: true } };
     },
   });
 
@@ -613,17 +1798,167 @@ export default function (pi: ExtensionAPI) {
 
   pi.registerCommand("archivist:sync-reflect", { description: "Sync reflect captures into Archivist/Sherpa-compatible memory", handler: async (args, ctx) => {
     const cfg = loadConfig(ctx.cwd);
-    try { ctx.ui.notify(await syncReflectMemory(memoryPaths(cfg, ctx.cwd), parseSyncArgs(args)), "success"); }
+    try {
+      const syncResult = await syncReflectMemory(memoryPaths(cfg, ctx.cwd), parseReflectSyncArgs(args));
+      triggerObsidianDocumentsFromSyncResult(cfg, ctx.cwd, syncResult);
+      ctx.ui.notify(syncResult, "success");
+    }
     catch (e: any) { ctx.ui.notify(`Archivist reflect sync failed: ${e.message ?? e}`, "error"); }
+  }});
+
+  pi.registerCommand("archivist:catalog:audit", { description: "Audit the repo-local catalog shared by Archivist and Sherpa", handler: async (_args, ctx) => {
+    const audit = auditCatalog(ctx.cwd);
+    const lines = [
+      "## Archivist Catalog Audit",
+      "",
+      `Catalog: ${audit.catalogPath}`,
+      `Rows: ${audit.rows}`,
+      `Directory rows: ${audit.directoryRows}`,
+      `File rows: ${audit.fileRows}`,
+      `Broken paths: ${audit.brokenPaths.length}`,
+      `Duplicate ids: ${audit.duplicateIds.length}`,
+      `Rows missing summaries: ${audit.missingSummaries.length}`,
+      `Likely over-indexed dirs: ${audit.likelyOverIndexedDirs.length}`,
+      "",
+      ...audit.brokenPaths.slice(0, 10).map((b) => `- Broken: ${b.id} -> ${b.path}`),
+      ...audit.likelyOverIndexedDirs.slice(0, 10).map((d) => `- Over-indexed? ${d.dir}: ${d.fileRows} direct file rows`),
+    ];
+    ctx.ui.notify(lines.join("\n"), audit.brokenPaths.length ? "warning" : "info");
+  }});
+
+  pi.registerCommand("archivist:graph:audit", { description: "Use existing graphify-out to suggest catalog improvements without writing noise", handler: async (args, ctx) => {
+    try {
+      const targetArg = args?.trim() || undefined;
+      const audit = auditGraphifyOutput(ctx.cwd, targetArg);
+      if (!audit.ok) {
+        ctx.ui.notify([
+          "## Archivist Graphify Audit",
+          "",
+          `Target: ${audit.targetRoot}`,
+          `Missing: ${audit.graphPath}`,
+          "",
+          "Run Graphify first on a selected doc/artifact corpus, for example:",
+          "graphify docs/ --no-viz",
+          "",
+          "Archivist will then use graphify-out/graph.json as discovery input for directory-first catalog suggestions.",
+        ].join("\n"), "warning");
+        return;
+      }
+      const lines = [
+        "## Archivist Graphify Audit",
+        "",
+        `Target: ${audit.targetRoot}`,
+        `Graph: ${audit.graphPath}`,
+        `Nodes: ${audit.nodes}`,
+        `Edges: ${audit.edges}`,
+        `Source files detected: ${audit.sourceFiles}`,
+        `Suggested directory rows: ${audit.suggestedDirectoryRows.length}`,
+        `Suggested hot file rows: ${audit.hotFiles.length}`,
+        "",
+        "### Directory-first catalog candidates",
+        ...(audit.suggestedDirectoryRows.length ? audit.suggestedDirectoryRows.map((d) => `- repo://${d.dir}/ (${d.fileCount} graph source files)`) : ["- none"]),
+        "",
+        "### Hot direct file candidates",
+        ...(audit.hotFiles.length ? audit.hotFiles.map((f) => `- repo://${f.file} (${f.nodeCount} graph nodes)`) : ["- none"]),
+        "",
+        "No catalog rows were written. Archivist should write only curated, meaningful rows after review.",
+      ];
+      ctx.ui.notify(lines.join("\n"), "info");
+    } catch (e: any) {
+      ctx.ui.notify(`Archivist graph audit failed: ${e.message ?? e}`, "error");
+    }
+  }});
+
+  pi.registerCommand("archivist:docs:trail", { description: "Show recent Archivist documentation job log entries. Usage: /archivist:docs:trail [limit] [status=<status>] [kind=<kind>]", handler: async (args, ctx) => {
+    const cfg = loadConfig(ctx.cwd);
+    const target = documentationJobLogPath(cfg, ctx.cwd);
+    const tokens = (args ?? "").trim().split(/\s+/).filter(Boolean);
+    const limitToken = tokens.find((token) => /^\d+$/.test(token));
+    const statusFilter = tokens.find((token) => token.startsWith("status="))?.slice("status=".length) || tokens.find((token) => ["written", "skipped", "fallback", "failed", "completed", "handoff", "passed"].includes(token));
+    const kindFilter = tokens.find((token) => token.startsWith("kind="))?.slice("kind=".length);
+    const limit = Math.max(1, Math.min(100, Number(limitToken) || 20));
+    if (!existsSync(target)) {
+      ctx.ui.notify(`Archivist documentation job log is empty: ${target}`, "info");
+      return;
+    }
+    const entries = readFileSync(target, "utf8").split(/\r?\n/).filter(Boolean).map((line) => {
+      try { return { line, parsed: JSON.parse(line) as { status?: string; kind?: string } }; }
+      catch { return { line, parsed: undefined }; }
+    }).filter((entry) => !statusFilter || entry.parsed?.status === statusFilter)
+      .filter((entry) => !kindFilter || entry.parsed?.kind === kindFilter)
+      .slice(-limit);
+    const filterText = [statusFilter ? `status=${statusFilter}` : undefined, kindFilter ? `kind=${kindFilter}` : undefined].filter(Boolean).join(" ") || "none";
+    ctx.ui.notify([`Archivist documentation job log: ${target}`, `Filter: ${filterText}`, "", ...entries.map((entry) => entry.line)].join("\n"), "info");
+  }});
+
+  pi.registerCommand("archivist:reliability:status", { description: "Summarize recent Archivist job reliability from the documentation job log", handler: async (args, ctx) => {
+    const cfg = loadConfig(ctx.cwd);
+    const target = documentationJobLogPath(cfg, ctx.cwd);
+    const limit = Math.max(1, Math.min(500, Number(args?.trim()) || 100));
+    if (!existsSync(target)) {
+      ctx.ui.notify(`Archivist reliability: no job log yet (${target})`, "info");
+      return;
+    }
+    const entries = readFileSync(target, "utf8").split(/\r?\n/).filter(Boolean).slice(-limit).map((line) => {
+      try { return JSON.parse(line) as { at?: string; kind?: string; status?: string; model?: string; reason?: string; error?: string }; }
+      catch { return undefined; }
+    }).filter((entry): entry is { at?: string; kind?: string; status?: string; model?: string; reason?: string; error?: string } => !!entry);
+    const byStatus = new Map<string, number>();
+    const byKind = new Map<string, number>();
+    for (const entry of entries) {
+      byStatus.set(entry.status ?? "unknown", (byStatus.get(entry.status ?? "unknown") ?? 0) + 1);
+      byKind.set(entry.kind ?? "unknown", (byKind.get(entry.kind ?? "unknown") ?? 0) + 1);
+    }
+    const concerning = entries.filter((entry) => ["failed", "fallback"].includes(entry.status ?? "")).slice(-10);
+    const formatCounts = (values: Map<string, number>) => [...values.entries()].sort((a, b) => b[1] - a[1]).map(([key, value]) => `- ${key}: ${value}`);
+    ctx.ui.notify([
+      "## Archivist Reliability Status",
+      "",
+      `Log: ${target}`,
+      `Entries reviewed: ${entries.length}`,
+      `Configured model: ${cfg.model.provider}/${cfg.model.id}`,
+      "",
+      "### Status counts",
+      ...formatCounts(byStatus),
+      "",
+      "### Kind counts",
+      ...formatCounts(byKind),
+      "",
+      "### Recent failures/fallbacks",
+      ...(concerning.length ? concerning.map((entry) => `- ${entry.at ?? "unknown"} ${entry.kind ?? "unknown"}/${entry.status ?? "unknown"}: ${entry.error ?? entry.reason ?? "(no reason)"}`) : ["- none"]),
+    ].join("\n"), concerning.length ? "warning" : "success");
   }});
 
   pi.registerCommand("archivist:docs:audit", { description: "Audit whether changed code/config needs documentation updates", handler: async (_args, ctx) => {
     const cfg = loadConfig(ctx.cwd);
-    const audit = await auditDocumentationDrift(state, cfg, ctx.cwd);
+    const runtime = { modelRegistry: ctx.modelRegistry, signal: ctx.signal };
+    const audit = await auditDocumentationDrift(state, cfg, ctx.cwd, runtime);
     if (audit.needed) {
-      ctx.ui.notify("Archivist detected possible documentation drift", "warning");
-      pi.sendMessage({ customType: "archivist-doc-audit", content: documentationAuditMessage(audit), display: true, details: audit }, { triggerTurn: true, deliverAs: "steer" });
-    } else ctx.ui.notify(`Archivist documentation audit: ${audit.reason}`, "info");
+      ctx.ui.notify("Archivist detected possible documentation drift; handling asynchronously with dedicated Archivist model", "warning");
+      const cwd = ctx.cwd;
+      const runtime = { modelRegistry: ctx.modelRegistry, signal: ctx.signal };
+      const notify = createSafeNotifier(ctx);
+      void completeDocumentationDrift(runtime, cfg, cwd, audit)
+        .then((handled) => {
+          const applied = handled.applied?.length ? ` Updated: ${[...new Set(handled.applied)].join(", ")}` : "";
+          const suffix = handled.handled ? applied || " No repo-doc update needed." : " Handoff written to Archivist inbox.";
+          notify?.(`Archivist async documentation maintenance complete.${suffix}`, handled.handled ? "success" : "warning");
+          sendArchivistMessage(pi, {
+            customType: "archivist-doc-maintenance-complete",
+            content: documentationMaintenanceReport(handled),
+            display: true,
+            details: handled,
+          });
+        })
+        .catch((error) => {
+          const message = error instanceof Error ? error.message : String(error);
+          appendInboxNote(cfg, cwd, "Documentation drift async failure", `Archivist asynchronous documentation maintenance failed.\n\n${message}`);
+          notify?.(`Archivist async documentation maintenance failed: ${message}`, "error");
+        });
+    } else {
+      appendDocumentationJobLog(cfg, ctx.cwd, { kind: "documentation-audit", status: "completed", trigger: "archivist:docs:audit", needed: false, reason: audit.reason, changedSources: audit.changedSources ?? [] });
+      ctx.ui.notify(`Archivist documentation audit: ${audit.reason}`, "info");
+    }
   }});
 
   pi.registerCommand("archivist:install-hook", { description: "Install an async git post-commit hook for Archivist", handler: async (_args, ctx) => {
@@ -636,7 +1971,8 @@ export default function (pi: ExtensionAPI) {
         "#!/bin/sh",
         "# Installed by pi Archivist extension. Runs asynchronously and never blocks commits.",
         "if [ -n \"$ARCHIVIST_SKIP\" ]; then exit 0; fi",
-        `ARCHIVIST_SKIP=1 node ${JSON.stringify(hookScript)} --repo \"$(git rev-parse --show-toplevel)\" --commit HEAD >> \"$(git rev-parse --git-dir)/archivist.log\" 2>&1 &`,
+        "if command -v bun >/dev/null 2>&1; then ARCHIVIST_RUNTIME=bun; else ARCHIVIST_RUNTIME=node; fi",
+        `ARCHIVIST_SKIP=1 \"$ARCHIVIST_RUNTIME\" ${JSON.stringify(hookScript)} --repo \"$(git rev-parse --show-toplevel)\" --commit HEAD >> \"$(git rev-parse --git-dir)/archivist.log\" 2>&1 &`,
         "exit 0",
         "",
       ].join("\n");
@@ -648,6 +1984,201 @@ export default function (pi: ExtensionAPI) {
     }
   }});
 
+  pi.registerCommand("archivist:memory:record-transcendental", { description: "Record a cross-project transcendental memory: <title> :: <memory>", handler: async (args, ctx) => {
+    const cfg = loadConfig(ctx.cwd);
+    const store = archivistMemoryStore(cfg);
+    if (!store) { ctx.ui.notify("memory API mirror is disabled for Archivist.", "warning"); return; }
+    const raw = args?.trim() ?? "";
+    const [titleRaw, ...bodyParts] = raw.split("::");
+    const title = titleRaw?.trim();
+    const body = bodyParts.join("::").trim();
+    if (!title || !body) { ctx.ui.notify("Usage: /archivist:memory:record-transcendental <title> :: <memory>", "warning"); return; }
+    const now = nowIso();
+    const id = stableMemoryId("transcendental", `${title}\n${body}`);
+    try {
+      await store.writeArtifact({
+        id,
+        scope: "transcendental",
+        type: "concept",
+        title,
+        summary: body.slice(0, 240),
+        text: body,
+        confidence: "medium",
+        status: "active",
+        tags: ["transcendental", "cross-project", "principle"],
+        aliases: [title],
+        routes: [title, "transcendental memory"],
+        keywords: [title, ...body.split(/\W+/).filter((word) => word.length > 4).slice(0, 16)],
+        createdAt: now,
+        updatedAt: now,
+      });
+      await writeEntityMentions(store, path.basename(ctx.cwd), id, `${title}\n${body}`, "transcendental-memory", now);
+      ctx.ui.notify(`Transcendental memory recorded: ${id}`, "success");
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      ctx.ui.notify(`Transcendental memory write failed: ${message}`, "error");
+    }
+  }});
+
+  pi.registerCommand("archivist:memory:research-links", { description: "Verify configured research source links in the memory API", handler: async (_args, ctx) => {
+    const cfg = loadConfig(ctx.cwd);
+    const store = archivistMemoryStore(cfg);
+    if (!store) { ctx.ui.notify("memory API mirror is disabled for Archivist.", "warning"); return; }
+    const links = Object.entries(cfg.researchLinks ?? {}).filter(([, id]) => typeof id === "string" && id);
+    if (!links.length) { ctx.ui.notify("No Archivist researchLinks configured.", "info"); return; }
+    const lines = ["## Archivist Research Links", ""];
+    for (const [name, id] of links) {
+      const results = await store.search({ text: String(id), limit: 5 }).catch(() => []);
+      const exact = results.find((result) => result.artifact.id === id);
+      lines.push(`- ${name}: ${id} — ${exact ? `${exact.artifact.type} ${exact.artifact.title}` : "not found by search"}`);
+    }
+    ctx.ui.notify(lines.join("\n"), "info");
+  }});
+
+  pi.registerCommand("archivist:memory:ingest-source", { description: "Mirror a source/research Markdown file into the memory API graph", handler: async (args, ctx) => {
+    const cfg = loadConfig(ctx.cwd);
+    const target = args?.trim();
+    if (!target) { ctx.ui.notify("Usage: /archivist:memory:ingest-source <path-to-markdown>", "warning"); return; }
+    ctx.ui.notify(`memory API source ingest queued asynchronously: ${target}`, "info");
+    void mirrorSourceDocumentToMemoryApi(cfg, ctx.cwd, target).then((result) => {
+      if (!result.mirrored) { ctx.ui.notify(result.reason || "Source document was not mirrored.", "warning"); return; }
+      ctx.ui.notify(`memory API source mirrored: ${result.title} (${result.claims} claims, ${result.chunks ?? 0} chunks, ${result.embeddings ?? 0} embeddings)`, "success");
+    }).catch((error) => {
+      recordMemoryIngestFailure(ctx.cwd, target, error);
+      const message = error instanceof Error ? error.message : String(error);
+      ctx.ui.notify(`memory API source ingest failed: ${message}`, "error");
+    });
+  }});
+
+  pi.registerCommand("archivist:memory:retry-failed-ingests", { description: "Retry failed Archivist Obsidian Markdown ingests into the memory API. Usage: /archivist:memory:retry-failed-ingests [limit]", handler: async (args, ctx) => {
+    const cfg = loadConfig(ctx.cwd);
+    const limit = Math.max(1, Math.min(500, Number(args?.trim()) || 100));
+    const failureLog = path.join(ctx.cwd, ".pi-memory", "archivist-inquirer-ingest-failures.jsonl");
+    if (!existsSync(failureLog)) { ctx.ui.notify(`No Archivist ingest failure log found: ${failureLog}`, "info"); return; }
+    const entries = readFileSync(failureLog, "utf8").split(/\r?\n/).filter(Boolean).slice(-limit);
+    const files = [...new Set(entries.map((line) => {
+      try { return JSON.parse(line).file as string | undefined; }
+      catch { return undefined; }
+    }).filter((file): file is string => !!file && file.endsWith(".md")))];
+    if (!files.length) { ctx.ui.notify(`No Markdown ingest failures found in last ${entries.length} entries.`, "info"); return; }
+
+    ctx.ui.notify(`Retrying ${files.length} Archivist failed ingests…`, "info");
+    let retried = 0;
+    let indexed = 0;
+    const failures: string[] = [];
+    for (const file of files) {
+      if (!existsSync(file)) { failures.push(`${file}: file no longer exists`); continue; }
+      retried++;
+      try {
+        const result = await ingestObsidianDocumentToMemoryApi(cfg, ctx.cwd, file);
+        if ((result as any)?.ingested) indexed++;
+        else failures.push(`${file}: ${(result as any)?.reason || "ingest did not report success"}`);
+      } catch (error) {
+        const message = error instanceof Error ? error.message : String(error);
+        failures.push(`${file}: ${message}`);
+        recordMemoryIngestFailure(ctx.cwd, file, error);
+      }
+    }
+    appendDocumentationJobLog(cfg, ctx.cwd, { kind: "memory-ingest-retry", status: failures.length ? "completed_with_failures" : "completed", trigger: "archivist:memory:retry-failed-ingests", scanned: entries.length, candidates: files.length, retried, indexed, failures: failures.slice(0, 20) });
+    ctx.ui.notify([
+      "## Archivist Failed Ingest Retry",
+      "",
+      `Failure log: ${failureLog}`,
+      `Scanned entries: ${entries.length}`,
+      `Candidate Markdown files: ${files.length}`,
+      `Retried: ${retried}`,
+      `Indexed: ${indexed}`,
+      `Failures: ${failures.length}`,
+      ...failures.slice(0, 10).map((failure) => `- ${failure}`),
+    ].join("\n"), failures.length ? "warning" : "success");
+  }});
+
+  pi.registerCommand("archivist:memory:vector-status", { description: "Audit memory API chunk/vector embedding readiness", handler: async (_args, ctx) => {
+    const cfg = loadConfig(ctx.cwd);
+    try {
+      const health = await memoryApiGet(cfg, "/api/v1/memory/health");
+      const warnings = Array.isArray(health.warnings) ? health.warnings : [];
+      ctx.ui.notify(
+        `memory API vector status: backend=${health.backend ?? "unknown"}, chunks=${health.chunks ?? 0}, embedded=${health.embedded ?? 0}, vectorIndex=${health.vectorIndex ? "yes" : "no"}, dimension=${health.embeddingDimension ?? "unknown"}${warnings.length ? `; warnings: ${warnings.join(", ")}` : ""}`,
+        warnings.length ? "warning" : "success",
+      );
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      ctx.ui.notify(`memory API vector status failed: ${message}`, "error");
+    }
+  }});
+
+  pi.registerCommand("archivist:model:smoke-test", { description: "Verify Archivist can call its configured dedicated model", handler: async (_args, ctx) => {
+    const cfg = loadConfig(ctx.cwd);
+    const model = ctx.modelRegistry.find(cfg.model.provider, cfg.model.id);
+    if (!model) { ctx.ui.notify(`Archivist model not found: ${cfg.model.provider}/${cfg.model.id}`, "error"); return; }
+    const auth = await ctx.modelRegistry.getApiKeyAndHeaders(model);
+    if (!auth.ok || !auth.apiKey) { ctx.ui.notify(`Archivist model auth unavailable: ${auth.ok ? "missing API key" : auth.error}`, "error"); return; }
+    const message: UserMessage = { role: "user", timestamp: Date.now(), content: [{ type: "text", text: "Reply with exactly: ARCHIVIST_MODEL_OK" }] };
+    try {
+      const response = await complete(model, { systemPrompt: "You are a smoke-test endpoint. Follow the user's instruction exactly.", messages: [message] }, { apiKey: auth.apiKey, headers: auth.headers, signal: ctx.signal });
+      const text = response.content.filter((c): c is { type: "text"; text: string } => c.type === "text").map((c) => c.text).join("\n").trim();
+      const ok = response.stopReason !== "aborted" && text.includes("ARCHIVIST_MODEL_OK");
+      appendDocumentationJobLog(cfg, ctx.cwd, { kind: "model-smoke-test", status: ok ? "passed" : "failed", trigger: "archivist:model:smoke-test", model: `${cfg.model.provider}/${cfg.model.id}`, stopReason: response.stopReason, response: text.slice(0, 200) });
+      ctx.ui.notify(ok ? `Archivist model smoke test passed: ${cfg.model.provider}/${cfg.model.id}` : `Archivist model smoke test failed: ${text || response.stopReason}`, ok ? "success" : "error");
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      appendDocumentationJobLog(cfg, ctx.cwd, { kind: "model-smoke-test", status: "failed", trigger: "archivist:model:smoke-test", model: `${cfg.model.provider}/${cfg.model.id}`, error: message });
+      ctx.ui.notify(`Archivist model smoke test failed: ${message}`, "error");
+    }
+  }});
+
+  pi.registerCommand("archivist:memory:smoke-test", { description: "Write and read a small Archivist/Sherpa memory API artifact", handler: async (_args, ctx) => {
+    const cfg = loadConfig(ctx.cwd);
+    const store = archivistMemoryStore(cfg);
+    if (!store) { ctx.ui.notify("memory API mirror is disabled for Archivist.", "warning"); return; }
+    const id = `smoke.${path.basename(ctx.cwd)}.${Date.now()}`;
+    try {
+      await store.writeArtifact({
+        id,
+        scope: "project",
+        project: path.basename(ctx.cwd),
+        type: "evidence",
+        title: "Archivist memory API smoke test",
+        summary: "Verifies Archivist can write and Sherpa-compatible memory store can read memory API artifacts.",
+        text: "memory-api archivist sherpa smoke test memory artifact",
+        confidence: "low",
+        status: "needs-review",
+        tags: ["archivist", "memory-api", "smoke-test"],
+        aliases: ["memory-api smoke test"],
+        routes: ["memory-api", "memory-store"],
+        keywords: ["archivist", "sherpa", "memory-api"],
+        createdAt: nowIso(),
+        updatedAt: nowIso(),
+      });
+      const artifact = await memoryApiGet(cfg, `/api/v1/memory/artifacts/${encodeURIComponent(id)}`);
+      const found = artifact?.id === id;
+      ctx.ui.notify(found ? `memory API smoke test passed: ${id}` : `memory API smoke test wrote ${id}, but read-back returned a different artifact.`, found ? "success" : "warning");
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      ctx.ui.notify(`memory API smoke test failed: ${message}`, "error");
+    }
+  }});
+
+  pi.registerCommand("archivist:memory:feedback-audit", { description: "Summarize Sherpa memory API retrieval feedback into an Archivist inbox review candidate", handler: async (args, ctx) => {
+    const cfg = loadConfig(ctx.cwd);
+    const store = archivistMemoryStore(cfg);
+    if (!store) { ctx.ui.notify("memory API mirror is disabled for Archivist.", "warning"); return; }
+    const limit = Number(args?.trim()) || 50;
+    try {
+      const feedback = await store.recentFeedback(limit);
+      if (!feedback.length) { ctx.ui.notify("No memory API retrieval feedback found.", "info"); return; }
+      const summary = summarizeFeedbackForReview(feedback);
+      if (!summary.missing.length && !summary.noisy.length) { ctx.ui.notify("memory API feedback has no repeated missing/noisy signals to review.", "info"); return; }
+      const target = appendInboxNote(cfg, ctx.cwd, "memory API retrieval feedback graph review", feedbackReviewMarkdown(feedback));
+      await writeFeedbackReviewToMemoryApi(store, cfg, ctx.cwd, feedback, target);
+      ctx.ui.notify(`Archivist feedback audit written: ${target}`, "success");
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      ctx.ui.notify(`Archivist memory API feedback audit failed: ${message}`, "error");
+    }
+  }});
+
   pi.registerCommand("archivist:status", { description: "Show Archivist config and hook status", handler: async (_args, ctx) => {
     const cfg = loadConfig(ctx.cwd);
     let hook = "unknown";
@@ -656,6 +2187,130 @@ export default function (pi: ExtensionAPI) {
       const hookPath = path.isAbsolute(gitDir) ? path.join(gitDir, "hooks", "post-commit") : path.join(ctx.cwd, gitDir, "hooks", "post-commit");
       hook = existsSync(hookPath) && readFileSync(hookPath, "utf8").includes("archivist-hook.mjs") ? `installed (${hookPath})` : `not installed (${hookPath})`;
     } catch { hook = "not a git repo"; }
-    ctx.ui.notify([`Archivist: ${cfg.enabled ? "enabled" : "disabled"}`, `Model: ${cfg.model.provider}/${cfg.model.id} (dedicated; main Pi model is not used)`, `Memory: ${obsidianMemoryPath(cfg)}`, `Hook: ${hook}`].join("\n"), "info");
+    const memoryApi = archivistMemoryApiConfig(cfg);
+    ctx.ui.notify([`Archivist: ${cfg.enabled ? "enabled" : "disabled"}`, `Model: ${cfg.model.provider}/${cfg.model.id} (dedicated; main Pi model is not used)`, `Memory: ${obsidianMemoryPath(cfg)}`, `Documentation job log: ${documentationJobLogPath(cfg, ctx.cwd)}`, `Inquirer Memory API mirror: ${memoryApi.enabled ? memoryApi.url : "disabled"}`, `Hook: ${hook}`].join("\n"), "info");
+  }});
+
+  pi.registerCommand("archivist:bootstrap", { description: "Bootstrap Archivist project catalog and durable memory structure for this repo", handler: async (_args, ctx) => {
+    const cfg = loadConfig(ctx.cwd);
+    const bootstrapPromptPath = path.join(path.dirname(__filename), "prompts", "BOOTSTRAP.md");
+    const bootstrapPrompt = existsSync(bootstrapPromptPath) ? readFileSync(bootstrapPromptPath, "utf8") : "Bootstrap the project catalog: scan docs, commits, and existing catalog entries. Create or update catalog.csv with high-signal routes.";
+    const runtime = { modelRegistry: ctx.modelRegistry, signal: ctx.signal };
+    const model = runtime.modelRegistry.find(cfg.model.provider, cfg.model.id);
+    if (!model) { ctx.ui.notify(`Archivist model not found: ${cfg.model.provider}/${cfg.model.id}`, "error"); return; }
+    const auth = await runtime.modelRegistry.getApiKeyAndHeaders(model);
+    if (!auth.ok || !auth.apiKey) { ctx.ui.notify(`No API key for ${model.provider}: ${auth.error}`, "error"); return; }
+    ctx.ui.notify("Archivist bootstrap running with dedicated model…", "info");
+
+    // Gather project context
+    const recent = await git(ctx.cwd, ["log", "-20", "--date=short", "--pretty=format:%h %ad %s", "--decorate"]).catch(() => "");
+    const status = await gitChanged(ctx.cwd);
+    const changedFiles = await gitChangedFiles(ctx.cwd);
+    const existingCatalog = readProjectCatalog(ctx.cwd);
+    const docSnippets: string[] = [];
+    const addSnippet = (rel: string, max = 3000) => {
+      const p = path.join(ctx.cwd, rel);
+      if (existsSync(p) && statSync(p).isFile()) docSnippets.push(`--- ${rel} ---\n${readFileSync(p, "utf8").slice(0, max)}`);
+    };
+    const walkMarkdown = (relDir: string, maxFiles = 40) => {
+      const root = path.join(ctx.cwd, relDir);
+      if (!existsSync(root) || !statSync(root).isDirectory()) return [] as string[];
+      const found: string[] = [];
+      const walk = (dir: string) => {
+        if (found.length >= maxFiles) return;
+        for (const name of readdirSync(dir).sort()) {
+          if (found.length >= maxFiles) return;
+          const abs = path.join(dir, name);
+          const rel = path.relative(ctx.cwd, abs).replace(/\\/g, "/");
+          if (statSync(abs).isDirectory()) walk(abs);
+          else if (/\.(md|mdx|rst)$/i.test(name)) found.push(rel);
+        }
+      };
+      walk(root);
+      return found;
+    };
+    const priorityDocs = ["README.md", "AGENTS.md", "CLAUDE.md", "CHANGELOG.md", "docs/README.md", ...walkMarkdown("docs")];
+    for (const rel of [...new Set(priorityDocs)]) addSnippet(rel, 3500);
+
+    const configSnippets: string[] = [];
+    for (const rel of ["package.json", "bunfig.toml", "tsconfig.json", "Dockerfile", "docker-compose.yml", ".pi/sherpa.config.json", ".pi/archivist.config.json"]) {
+      const p = path.join(ctx.cwd, rel);
+      if (existsSync(p) && statSync(p).isFile()) configSnippets.push(`--- ${rel} ---\n${readFileSync(p, "utf8").slice(0, 2500)}`);
+    }
+
+    const entrypointSnippets: string[] = [];
+    for (const rel of ["src/server/index.ts", "src/server/core.ts", "src/server/public/client.js", "src/cli/send.ts"]) {
+      const p = path.join(ctx.cwd, rel);
+      if (existsSync(p) && statSync(p).isFile()) entrypointSnippets.push(`--- ${rel} ---\n${readFileSync(p, "utf8").slice(0, 2500)}`);
+    }
+
+    const memoryRoot = obsidianMemoryPath(cfg);
+    const memorySnippets: string[] = [];
+    for (const rel of ["schema.md", ...walkMarkdown(path.relative(ctx.cwd, path.join(memoryRoot, "wiki")).replace(/\\/g, "/"), 24), ...walkMarkdown(path.relative(ctx.cwd, path.join(memoryRoot, "inbox")).replace(/\\/g, "/"), 12)]) {
+      const p = path.isAbsolute(rel) ? rel : path.join(ctx.cwd, rel);
+      if (existsSync(p) && statSync(p).isFile()) memorySnippets.push(`--- ${path.relative(ctx.cwd, p).replace(/\\/g, "/")} ---\n${readFileSync(p, "utf8").slice(0, 2200)}`);
+    }
+
+    const message: UserMessage = {
+      role: "user",
+      timestamp: Date.now(),
+      content: [{ type: "text", text: [
+        `Project: ${path.basename(ctx.cwd)}`,
+        `CWD: ${ctx.cwd}`,
+        ``,
+        `Recent commits:\n${recent || "(none)"}`,
+        ``,
+        `Changed files (git status):\n${changedFiles.join("\n") || "(none)"}`,
+        ``,
+        `Existing catalog rows: ${existingCatalog.length}`,
+        existingCatalog.length ? JSON.stringify(existingCatalog.map(r => ({ id: r.id, type: r.type, path: r.path, title: r.title })), null, 2).slice(0, 3000) : "",
+        ``,
+        `Project docs:\n${docSnippets.join("\n\n") || "(none)"}`,
+        ``,
+        `Project config/build files:\n${configSnippets.join("\n\n") || "(none)"}`,
+        ``,
+        `Main entrypoint excerpts:\n${entrypointSnippets.join("\n\n") || "(none)"}`,
+        ``,
+        `Existing Obsidian project memory excerpts:\n${memorySnippets.join("\n\n").slice(0, 12000) || "(none)"}`,
+      ].join("\n\n") }],
+    };
+
+    const response = await complete(model, { systemPrompt: bootstrapPrompt, messages: [message] }, { apiKey: auth.apiKey, headers: auth.headers, signal: ctx.signal });
+    if (response.stopReason === "aborted") { ctx.ui.notify("Archivist bootstrap aborted.", "warning"); return; }
+    const text = response.content.filter((c): c is { type: "text"; text: string } => c.type === "text").map(c => c.text).join("\n").trim();
+
+    // Parse catalog.csv updates from the response.
+    // Primary: match a ```csv block and extract its CSV content.
+    // Fallback: scan all ``` blocks and pick the first that looks like CSV (has a header row
+    // with 'id' and 'path' columns).
+    const allBlocks = [...text.matchAll(/```(?:csv)?\n?([\s\S]*?)\n?```/gi)];
+    const csvBlock = allBlocks.find((m) => {
+      const inner = (m[1] ?? "").trim();
+      return /^id[,|\s]/.test(inner) || /[,|\s]path[,|\s]/.test(inner);
+    });
+    const catalogLines = (csvBlock?.[1] ?? "").split(/\r?\n/).filter((l) => l.trim());
+    let rowsAdded = 0;
+    if (catalogLines.length > 1) {
+      const header = catalogLines[0]!;
+      const body = catalogLines.slice(1);
+      const catalogPath = path.join(ctx.cwd, "catalog.csv");
+      mkdirSync(path.dirname(catalogPath), { recursive: true });
+      const existing = existingCatalog.map(r => r.id);
+      for (const line of body) {
+        const cells = line.split(",").map(c => c.replace(/^"|"$/g, "").trim());
+        const row: Record<string, string> = {};
+        header.split(",").forEach((key, i) => { row[key.trim()] = cells[i] ?? ""; });
+        if (row.id && !existing.includes(row.id)) {
+          upsertCatalogRow(ctx.cwd, row);
+          rowsAdded++;
+        }
+      }
+    }
+
+    const summary = text.slice(0, 3000);
+    appendJournalNote(cfg, ctx.cwd, "Archivist bootstrap", [summary, rowsAdded ? `\nCatalog rows added: ${rowsAdded}` : "\nNo new catalog rows added."].join(""));
+    appendDocumentationJobLog(cfg, ctx.cwd, { kind: "bootstrap", status: "completed", trigger: "archivist:bootstrap", rowsAdded, summary: summary.slice(0, 800) });
+    ctx.ui.notify([`Archivist bootstrap complete.`, rowsAdded ? `Rows added: ${rowsAdded}` : "No new catalog rows.", "", summary.slice(0, 800)].join("\n"), "success");
+    sendArchivistMessage(pi, { customType: "archivist-bootstrap-complete", content: summary, display: true });
   }});
 }

@@ -8,7 +8,7 @@ Follow the Archivist operating doctrine first:
 
 ## Mission
 
-Create or refresh the initial Obsidian project-memory control plane for an already-existing repository. The main output is a useful `catalog.csv` that lets Sherpa and Archivist navigate documentation and durable project knowledge.
+Create or refresh the initial project-memory control plane for an already-existing repository. The main output is a useful repo-local `<repo>/catalog.csv` that lets Sherpa and Archivist navigate both repo documentation and durable Obsidian project-memory artifacts. The catalog is a curated navigation map, not an exhaustive document index.
 
 ## Scope
 
@@ -25,19 +25,22 @@ High-priority inputs:
 - `CHANGELOG.md`, release notes, migration docs
 - `.pi/`, `routes.csv`, `.pi/sherpa.routes.md`
 - package/build/deploy/config files that define project shape
-- existing Obsidian project memory, especially `catalog.csv`, `schema.md`, `wiki/*`, `journal`, `inbox`, `sources`
+- existing Obsidian project memory, especially `schema.md`, `wiki/*`, `journal`, `inbox`, `sources`
+- existing repo-local `catalog.csv`, if present
 
 ## Required Behavior
 
-1. Use Sherpa's existing Obsidian structure only. Do not invent new folders.
-2. Use `catalog.csv` as the documentation/navigation control plane.
-3. Register every important existing doc/page in `catalog.csv`.
-4. Preserve existing catalog rows when they are still valid.
-5. Add aliases, tags, routes, and keywords that make retrieval useful.
-6. Link repo-local docs as source/documentation entries when they are not Obsidian wiki pages.
-7. Create Obsidian `inbox` follow-ups for unclear or stale docs rather than guessing.
-8. If substantial new prose is needed, recommend the technical doc writer skill instead of writing large docs directly.
-9. In team projects, treat commit history as evidence of distributed intent. Prefer synthesizing across related commits/authors over interpreting one atomic commit in isolation.
+1. Use Sherpa's existing Obsidian artifact structure only. Do not invent new folders.
+2. Use repo-local `<repo>/catalog.csv` as the documentation/navigation control plane.
+3. Register important docs/pages/collections in `<repo>/catalog.csv`; do not list every file.
+4. Prefer a single directory/collection row when a directory contains many related documents or artifacts, and describe the directory purpose, when to use it, and high-signal routes/keywords.
+5. Add individual file rows only for essential exposed files or expected high-demand retrieval targets: index/README files, canonical entrypoints, very important current-truth docs, operational runbooks that must be directly reachable, frequently requested or likely-to-be-requested files, or major decisions/evidence that are frequently cited. It is fine for a directory row to have a small number of direct child file rows for these hot paths. All other documentation/artifacts should be reached through the directory row.
+6. Preserve existing catalog rows when they are still valid.
+7. Add aliases, tags, routes, and keywords that make retrieval useful.
+8. Link repo-local docs or directories as source/documentation entries when they are not Obsidian wiki pages.
+9. Create Obsidian `inbox` follow-ups for unclear or stale docs rather than guessing.
+10. If substantial new prose is needed, recommend the technical doc writer skill instead of writing large docs directly.
+11. In team projects, treat commit history as evidence of distributed intent. Prefer synthesizing across related commits/authors over interpreting one atomic commit in isolation.
 
 Technical doc writer skill:
 
@@ -48,7 +51,7 @@ Technical doc writer skill:
 Use the existing header if `catalog.csv` exists. Otherwise use:
 
 ```csv
-id,type,path,title,summary,aliases,tags,status,confidence,updated,based_on,supports,implements,derives_from,related,routes,keywords
+id,scope,project,area,category,type,path,title,summary,aliases,tags,status,confidence,updated,based_on,supports,implements,derives_from,related,applies_research,applied_by_project,generalizes_from,specializes,routes,keywords
 ```
 
 Suggested `type` values, using existing ontology:
@@ -71,7 +74,7 @@ Produce a concise report:
 Verdict: initialized | refreshed | needs-review
 
 ### Catalog
-- Path: <obsidian-project>/catalog.csv
+- Path: <repo>/catalog.csv
 - Rows added: N
 - Rows preserved: N
 - Rows needing review: N
