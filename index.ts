@@ -59,7 +59,6 @@ const DEFAULT_ARCHIVIST_CONFIG = {
 };
 
 type ArchivistConfig = typeof DEFAULT_ARCHIVIST_CONFIG & {
-  memoryStore?: { surreal?: MemoryApiStoreConfig };
   memoryApi?: MemoryApiStoreConfig;
 };
 type DocumentationModelRuntime = { modelRegistry: ExtensionContext["modelRegistry"]; signal: AbortSignal };
@@ -112,7 +111,7 @@ function loadConfig(cwd: string): ArchivistConfig {
   const projectSherpa = readJsonIfExists(path.join(cwd, ".pi", "sherpa.config.json"));
   for (const sherpa of [globalSherpa, projectSherpa]) {
     if (sherpa?.memory) (cfg as any).memory = mergeConfig(cfg.memory, sherpa.memory);
-    if (sherpa?.memoryStore) (cfg as any).memoryStore = mergeConfig(cfg.memoryStore, sherpa.memoryStore);
+    // Archivist uses memoryApi config; it does not inherit memoryStore from Sherpa.
   }
 
   const projectArchivist = readJsonIfExists(path.join(cwd, ".pi", "archivist.config.json"));
@@ -125,10 +124,7 @@ function obsidianMemoryPath(cfg: ArchivistConfig) {
 }
 
 function archivistMemoryApiConfig(cfg: ArchivistConfig): MemoryApiStoreConfig {
-  // Backward compatibility: older Sherpa/Archivist configs named the Memory
-  // API mirror `memoryStore.surreal`. Treat that as an API endpoint config only;
-  // it must not imply direct database access from Archivist.
-  return mergeConfig(cfg.memoryApi ?? DEFAULT_ARCHIVIST_CONFIG.memoryApi, cfg.memoryStore?.surreal);
+  return cfg.memoryApi ?? DEFAULT_ARCHIVIST_CONFIG.memoryApi;
 }
 
 function archivistMemoryStore(cfg: ArchivistConfig) {
