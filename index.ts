@@ -759,7 +759,7 @@ async function modelDocumentationMaintenance(runtime: DocumentationModelRuntime,
   return { decision: "handoff", summary: "Archivist model returned unparsable documentation maintenance output after one repair attempt.", handoff: `${documentationAuditMessage(audit)}\n\nRaw model output:\n\n${text.slice(0, 4000)}` };
 }
 
-async function completeDocumentationDrift(runtime: DocumentationModelRuntime, cfg: ArchivistConfig, cwd: string, audit: { changedSources?: string[]; candidates?: string[] }) {
+function startDocumentationMaintenanceJob(cfg: ArchivistConfig, cwd: string, audit: { changedSources?: string[]; candidates?: string[] }) {
   const jobId = stableMemoryId("doc-job", `${nowIso()}\n${audit.changedSources?.join("\n") ?? ""}\n${audit.candidates?.join("\n") ?? ""}`);
   appendDocumentationJobLog(cfg, cwd, {
     jobId,
@@ -770,40 +770,58 @@ async function completeDocumentationDrift(runtime: DocumentationModelRuntime, cf
     candidateDocs: audit.candidates ?? [],
     model: `${cfg.model.provider}/${cfg.model.id}`,
   });
+  return jobId;
+}
 
+function applyDocumentationUpdates(cwd: string, result: DocumentationMaintenanceResult, allowedDocs: Set<string>) {
+  const applied: string[] = [];
+  const failures: string[] = [];
+  if (result.decision !== "updated") return { applied, failures };
+
+  for (const update of result.updates ?? []) {
+    if (!update.path || !update.oldText || update.newText === undefined) continue;
+    const safeUpdatePath = safeRepoRelativePath(cwd, update.path);
+    if (!safeUpdatePath || !allowedDocs.has(safeUpdatePath)) {
+      failures.push(`${update.path}: not in Archivist candidate docs`);
+      continue;
+    }
+    const target = path.join(cwd, safeUpdatePath);
+    if (!existsSync(target)) {
+      failures.push(`${update.path}: file does not exist`);
+      continue;
+    }
+    const current = readFileSync(target, "utf8");
+    const count = current.split(update.oldText).length - 1;
+    if (count !== 1) {
+      failures.push(`${update.path}: oldText matched ${count} times`);
+      continue;
+    }
+    writeFileSync(target, current.replace(update.oldText, update.newText));
+    applied.push(safeUpdatePath);
+  }
+  return { applied, failures };
+}
+
+function finishAppliedDocumentationUpdates(cfg: ArchivistConfig, cwd: string, jobId: string, result: DocumentationMaintenanceResult, applied: string[], failures: string[]) {
+  appendJournalNote(cfg, cwd, "Documentation drift handled", [`Archivist applied documentation updates with ${cfg.model.provider}/${cfg.model.id}.`, `Summary: ${result.summary ?? "(none)"}`, "", "Updated docs:", ...[...new Set(applied)].map((file) => `- ${file}`), failures.length ? "" : undefined, failures.length ? "Skipped/failed updates:" : undefined, ...failures.map((failure) => `- ${failure}`)].filter(Boolean).join("\n"));
+  appendDocumentationJobLog(cfg, cwd, { jobId, kind: "documentation-maintenance", status: "completed", decision: result.decision, summary: result.summary ?? "", applied: [...new Set(applied)], failures });
+}
+
+function finishDocumentationHandoff(cfg: ArchivistConfig, cwd: string, jobId: string, audit: { changedSources?: string[]; candidates?: string[] }, result: DocumentationMaintenanceResult, failures: string[]) {
+  const note = [result.handoff || documentationAuditMessage(audit), failures.length ? "\nSkipped/failed updates:" : "", ...failures.map((failure) => `- ${failure}`)].join("\n");
+  const inboxNote = appendInboxNote(cfg, cwd, "Documentation drift technical-doc-writer handoff", note);
+  appendDocumentationJobLog(cfg, cwd, { jobId, kind: "documentation-maintenance", status: "handoff", decision: result.decision ?? "handoff", summary: result.summary ?? "", handoff: inboxNote, applied: [], failures });
+}
+
+async function completeDocumentationDrift(runtime: DocumentationModelRuntime, cfg: ArchivistConfig, cwd: string, audit: { changedSources?: string[]; candidates?: string[] }) {
+  const jobId = startDocumentationMaintenanceJob(cfg, cwd, audit);
   try {
     const result = await modelDocumentationMaintenance(runtime, cfg, cwd, audit);
     const allowedDocs = new Set(safeExistingDocCandidates(cwd, audit.candidates));
-    const applied: string[] = [];
-    const failures: string[] = [];
-
-    if (result.decision === "updated") {
-      for (const update of result.updates ?? []) {
-        if (!update.path || !update.oldText || update.newText === undefined) continue;
-        const safeUpdatePath = safeRepoRelativePath(cwd, update.path);
-        if (!safeUpdatePath || !allowedDocs.has(safeUpdatePath)) {
-          failures.push(`${update.path}: not in Archivist candidate docs`);
-          continue;
-        }
-        const target = path.join(cwd, safeUpdatePath);
-        if (!existsSync(target)) {
-          failures.push(`${update.path}: file does not exist`);
-          continue;
-        }
-        const current = readFileSync(target, "utf8");
-        const count = current.split(update.oldText).length - 1;
-        if (count !== 1) {
-          failures.push(`${update.path}: oldText matched ${count} times`);
-          continue;
-        }
-        writeFileSync(target, current.replace(update.oldText, update.newText));
-        applied.push(safeUpdatePath);
-      }
-    }
+    const { applied, failures } = applyDocumentationUpdates(cwd, result, allowedDocs);
 
     if (applied.length) {
-      appendJournalNote(cfg, cwd, "Documentation drift handled", [`Archivist applied documentation updates with ${cfg.model.provider}/${cfg.model.id}.`, `Summary: ${result.summary ?? "(none)"}`, "", "Updated docs:", ...[...new Set(applied)].map((file) => `- ${file}`), failures.length ? "" : undefined, failures.length ? "Skipped/failed updates:" : undefined, ...failures.map((failure) => `- ${failure}`)].filter(Boolean).join("\n"));
-      appendDocumentationJobLog(cfg, cwd, { jobId, kind: "documentation-maintenance", status: "completed", decision: result.decision, summary: result.summary ?? "", applied: [...new Set(applied)], failures });
+      finishAppliedDocumentationUpdates(cfg, cwd, jobId, result, applied, failures);
       return { handled: true, applied, failures, result };
     }
 
@@ -814,9 +832,7 @@ async function completeDocumentationDrift(runtime: DocumentationModelRuntime, cf
       return { handled: true, applied, failures, result };
     }
 
-    const note = [result.handoff || documentationAuditMessage(audit), failures.length ? "\nSkipped/failed updates:" : "", ...failures.map((failure) => `- ${failure}`)].join("\n");
-    const inboxNote = appendInboxNote(cfg, cwd, "Documentation drift technical-doc-writer handoff", note);
-    appendDocumentationJobLog(cfg, cwd, { jobId, kind: "documentation-maintenance", status: "handoff", decision: result.decision ?? "handoff", summary: result.summary ?? "", handoff: inboxNote, applied: [], failures });
+    finishDocumentationHandoff(cfg, cwd, jobId, audit, result, failures);
     return { handled: false, applied, failures, result };
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error);
