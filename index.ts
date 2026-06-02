@@ -1491,29 +1491,26 @@ function formatPreserveNote(params: PreserveParams, pageType: string): string {
   ].join("\n");
 }
 
-async function writeAndIndexPreservedReflection(cfg: ArchivistConfig, cwd: string, params: PreserveParams, destination: string): Promise<PreserveWriteResult> {
-  if (destination !== "obsidian") {
-    throw new Error(`archivist_preserve cannot verify durable indexed writes for destination: ${destination}`);
-  }
-
+function writePreserveNote(cfg: ArchivistConfig, params: PreserveParams) {
   const semantic = semanticPreserveType(params.type);
   const dir = path.join(obsidianMemoryPath(cfg), "wiki", semantic.folder);
   mkdirSync(dir, { recursive: true });
   const target = path.join(dir, `${slug(params.title || params.refId)}.md`);
-  const note = formatPreserveNote(params, semantic.pageType);
-  writeFileSync(target, note);
-
+  writeFileSync(target, formatPreserveNote(params, semantic.pageType));
   if (!existsSync(target) || !readFileSync(target, "utf8").includes(params.refId)) {
     throw new Error(`preservation verification failed: note was not written with refId ${params.refId}`);
   }
+  return { target, pageType: semantic.pageType };
+}
 
+function upsertPreserveCatalogRow(cwd: string, params: PreserveParams, target: string, pageType: string) {
   const relativePath = path.relative(cwd, target).replace(/\\/g, "/");
   const catalogId = `reflect.${params.refId}`;
   upsertCatalogRow(cwd, {
     id: catalogId,
     scope: "project",
     project: path.basename(cwd),
-    type: semantic.pageType,
+    type: pageType,
     path: relativePath,
     title: params.title,
     summary: params.summary.slice(0, 240),
@@ -1526,7 +1523,10 @@ async function writeAndIndexPreservedReflection(cfg: ArchivistConfig, cwd: strin
     routes: [params.title, ...(params.tags || [])].filter(Boolean).join("|"),
     keywords: [params.refId, params.type || "", params.importance || ""].filter(Boolean).join("|"),
   });
+  return { relativePath, catalogId };
+}
 
+async function indexPreserveNote(cfg: ArchivistConfig, cwd: string, destination: string, target: string, relativePath: string, catalogId: string): Promise<PreserveWriteResult> {
   try {
     const ingest = await ingestObsidianDocumentToMemoryApi(cfg, cwd, target);
     return {
@@ -1549,6 +1549,16 @@ async function writeAndIndexPreservedReflection(cfg: ArchivistConfig, cwd: strin
       indexWarning: error instanceof Error ? error.message : String(error),
     };
   }
+}
+
+async function writeAndIndexPreservedReflection(cfg: ArchivistConfig, cwd: string, params: PreserveParams, destination: string): Promise<PreserveWriteResult> {
+  if (destination !== "obsidian") {
+    throw new Error(`archivist_preserve cannot verify durable indexed writes for destination: ${destination}`);
+  }
+
+  const { target, pageType } = writePreserveNote(cfg, params);
+  const { relativePath, catalogId } = upsertPreserveCatalogRow(cwd, params, target, pageType);
+  return indexPreserveNote(cfg, cwd, destination, target, relativePath, catalogId);
 }
 
 const distillSchema = Type.Object({
