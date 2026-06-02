@@ -882,13 +882,20 @@ function catalogCoversPath(cwd: string, targetRel: string) {
   return false;
 }
 
+function graphifySourceCandidates(node: any) {
+  return [node?.path, node?.file, node?.source, node?.source_path, node?.file_path, node?.filepath, node?.uri, node?.id];
+}
+
+function validGraphifySourceCandidate(value: string) {
+  if (/^https?:\/\//i.test(value)) return false;
+  return /\.(md|mdx|txt|rst|py|ts|tsx|js|jsx|json|yaml|yml|toml|csv|pdf)$/i.test(value) || value.includes("/");
+}
+
 function extractGraphifySourcePath(node: any): string | undefined {
-  const candidates = [node?.path, node?.file, node?.source, node?.source_path, node?.file_path, node?.filepath, node?.uri, node?.id];
-  for (const raw of candidates) {
+  for (const raw of graphifySourceCandidates(node)) {
     if (typeof raw !== "string" || !raw.trim()) continue;
     const value = raw.trim();
-    if (/^https?:\/\//i.test(value)) continue;
-    if (/\.(md|mdx|txt|rst|py|ts|tsx|js|jsx|json|yaml|yml|toml|csv|pdf)$/i.test(value) || value.includes("/")) return value;
+    if (validGraphifySourceCandidate(value)) return value;
   }
   return undefined;
 }
