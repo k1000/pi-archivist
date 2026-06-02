@@ -321,18 +321,41 @@ async function collectQueuedFiles(repo, shas) {
   return [...allFiles];
 }
 
+function localProviderBaseUrl(provider) {
+  return provider?.baseUrl?.includes("127.0.0.1") || provider?.baseUrl?.includes("localhost");
+}
+
+function configuredApiKey(provider) {
+  if (!provider?.apiKey) return undefined;
+  return process.env[provider.apiKey] || provider.apiKey;
+}
+
+function providerHasModel(provider, modelId) {
+  return Array.isArray(provider?.models) && provider.models.some(model => model.id === modelId);
+}
+
+function validateConfigChecks(cfg, repo, provider) {
+  const apiKeyValue = configuredApiKey(provider);
+  const enabled = cfg.enabled !== false;
+  const commitHook = cfg.commitHook?.enabled !== false;
+  const baseUrl = provider?.baseUrl;
+  const modelName = `${cfg.model.provider}/${cfg.model.id}`;
+  const memoryPath = obsidianRoot(cfg);
+  const jobLog = documentationJobLogPath(cfg, repo);
+  return [
+    { name: "enabled", ok: enabled, detail: String(enabled) },
+    { name: "commitHook", ok: commitHook, detail: String(commitHook) },
+    { name: "provider", ok: !!baseUrl, detail: baseUrl || `missing provider ${cfg.model.provider}` },
+    { name: "model", ok: providerHasModel(provider, cfg.model.id), detail: modelName },
+    { name: "apiKey", ok: !!apiKeyValue || localProviderBaseUrl(provider), detail: provider?.apiKey ? "configured" : "not required/local or missing" },
+    { name: "memoryPath", ok: !!memoryPath, detail: memoryPath },
+    { name: "jobLog", ok: !!jobLog, detail: jobLog },
+  ];
+}
+
 async function validateConfig(cfg, repo) {
   const provider = await providerConfig(cfg.model.provider);
-  const apiKeyValue = provider?.apiKey && process.env[provider.apiKey] ? process.env[provider.apiKey] : provider?.apiKey;
-  const checks = [
-    { name: "enabled", ok: cfg.enabled !== false, detail: String(cfg.enabled !== false) },
-    { name: "commitHook", ok: cfg.commitHook?.enabled !== false, detail: String(cfg.commitHook?.enabled !== false) },
-    { name: "provider", ok: !!provider?.baseUrl, detail: provider?.baseUrl || `missing provider ${cfg.model.provider}` },
-    { name: "model", ok: !!provider?.models?.some?.(model => model.id === cfg.model.id), detail: `${cfg.model.provider}/${cfg.model.id}` },
-    { name: "apiKey", ok: !!apiKeyValue || provider?.baseUrl?.includes("127.0.0.1") || provider?.baseUrl?.includes("localhost"), detail: provider?.apiKey ? "configured" : "not required/local or missing" },
-    { name: "memoryPath", ok: !!obsidianRoot(cfg), detail: obsidianRoot(cfg) },
-    { name: "jobLog", ok: !!documentationJobLogPath(cfg, repo), detail: documentationJobLogPath(cfg, repo) },
-  ];
+  const checks = validateConfigChecks(cfg, repo, provider);
   const ok = checks.every(check => check.ok);
   console.log(JSON.stringify({ ok, repo, model: `${cfg.model.provider}/${cfg.model.id}`, checks }, null, 2));
   return ok;
