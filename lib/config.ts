@@ -38,6 +38,7 @@ export const DEFAULT_ARCHIVIST_CONFIG = {
 
 export type ArchivistConfig = typeof DEFAULT_ARCHIVIST_CONFIG & {
   memoryApi?: typeof DEFAULT_ARCHIVIST_CONFIG.memoryApi & Record<string, unknown>;
+  memoryStore?: Record<string, unknown>;
 };
 
 function mergeConfig<T>(base: T, over: unknown): T {
@@ -61,6 +62,28 @@ function readJsonIfExists(file: string): unknown {
   catch { return undefined; }
 }
 
+function memoryApiFromLegacySurreal(value: unknown): Record<string, unknown> | undefined {
+  if (!value) return undefined;
+  if (typeof value === "string") return { enabled: true, mode: "memory-api", url: value };
+  if (typeof value !== "object" || Array.isArray(value)) return undefined;
+  const legacy = value as Record<string, unknown>;
+  const url = legacy.url ?? legacy.endpoint ?? legacy.baseUrl;
+  if (typeof url !== "string" || !url.trim()) return undefined;
+  return {
+    enabled: legacy.enabled ?? true,
+    mode: "memory-api",
+    url,
+    tokenEnv: legacy.tokenEnv,
+    token: legacy.token,
+  };
+}
+
+function applyLegacyMemoryStoreAlias<T extends ArchivistConfig>(cfg: T): T {
+  const legacy = memoryApiFromLegacySurreal((cfg.memoryStore as any)?.surreal);
+  if (!legacy) return cfg;
+  return { ...cfg, memoryApi: mergeConfig(cfg.memoryApi ?? DEFAULT_ARCHIVIST_CONFIG.memoryApi, legacy) };
+}
+
 export function loadConfig(cwd: string): ArchivistConfig {
   const cfg = structuredClone(DEFAULT_ARCHIVIST_CONFIG) as ArchivistConfig;
   cfg.memory.obsidianMemoryPath = projectMemoryRel(cwd);
@@ -73,12 +96,12 @@ export function loadConfig(cwd: string): ArchivistConfig {
   const projectSherpa = readJsonIfExists(path.join(cwd, ".pi", "sherpa.config.json"));
   for (const sherpa of [globalSherpa, projectSherpa] as any[]) {
     if (sherpa?.memory) (cfg as any).memory = mergeConfig(cfg.memory, sherpa.memory);
-    // Archivist uses memoryApi config; it does not inherit memoryStore from Sherpa.
+    if (sherpa?.memoryStore?.surreal) (cfg as any).memoryStore = mergeConfig((cfg as any).memoryStore ?? {}, { surreal: sherpa.memoryStore.surreal });
   }
 
   const globalArchivist = readJsonIfExists(path.join(home, ".pi", "archivist.config.json"));
   const projectArchivist = readJsonIfExists(path.join(cwd, ".pi", "archivist.config.json"));
-  return mergeConfig(mergeConfig(cfg, globalArchivist), projectArchivist);
+  return applyLegacyMemoryStoreAlias(mergeConfig(mergeConfig(cfg, globalArchivist), projectArchivist));
 }
 
 export function obsidianMemoryPath(cfg: ArchivistConfig): string {

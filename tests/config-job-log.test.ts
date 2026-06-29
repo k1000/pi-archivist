@@ -16,6 +16,7 @@ try {
 
   writeFileSync(path.join(home, ".pi", "sherpa.config.json"), JSON.stringify({
     memory: { obsidianVault: path.join(root, "vault") },
+    memoryStore: { surreal: { url: "https://legacy-memory.example", tokenEnv: "LEGACY_TOKEN" } },
   }));
   writeFileSync(path.join(home, ".pi", "archivist.config.json"), JSON.stringify({
     documentationJobs: { logPath: ".global/archivist.jsonl" },
@@ -29,6 +30,8 @@ try {
   assert.equal(cfg.model.provider, "test-provider");
   assert.equal(cfg.model.id, "test-model");
   assert.equal(cfg.memory.obsidianVault, path.join(root, "vault"));
+  assert.equal(cfg.memoryApi.url, "https://legacy-memory.example");
+  assert.equal(cfg.memoryApi.tokenEnv, "LEGACY_TOKEN");
   assert.equal(obsidianMemoryPath(cfg), path.join(root, "vault", "projects", "repo-name"));
 
   const logPath = documentationJobLogPath(cfg, repo);
@@ -45,4 +48,4 @@ try {
   rmSync(root, { recursive: true, force: true });
 }
 
-console.log("config/job-log tests passed=11");
+console.log("config/job-log tests passed=13");

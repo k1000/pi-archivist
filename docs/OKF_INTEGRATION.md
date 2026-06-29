@@ -39,7 +39,7 @@ The adapter is deliberately tolerant and accepts common OKF-like field names:
 | `tags` | `tags` |
 | `status` | `status` |
 | `confidence` | `confidence` |
-| `updated` / `last_updated` | `last_updated` |
+| `updated` / `last_updated` | frontmatter `last_updated`; catalog row `updated` |
 | `content` / `body` | Markdown current-truth body |
 | `evidence` | Evidence section bullets |
 
