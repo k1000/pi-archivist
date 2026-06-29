@@ -11,6 +11,13 @@
   "homepage": "https://github.com/k1000/pi-archivist#readme",
   "scripts": {
     "check": "bun scripts/check-extension.ts",
+    "test:okf": "bun tests/okf.test.ts",
+    "test:config": "bun tests/config-job-log.test.ts",
+    "test:memory-api": "bun tests/memory-api.test.ts",
+    "test:markdown-note": "bun tests/markdown-note.test.ts",
+    "test:hook-safety": "bun tests/hook-safety.test.ts",
+    "test": "bun tests/markdown-note.test.ts && bun tests/okf.test.ts && bun tests/config-job-log.test.ts && bun tests/memory-api.test.ts && bun tests/document-chunks.test.ts && bun tests/hook-safety.test.ts",
+    "okf": "bun scripts/okf-convert.ts",
     "hook:help": "bun bin/archivist-hook.mjs --help"
   },
   "engines": {

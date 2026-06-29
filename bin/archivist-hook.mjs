@@ -242,15 +242,16 @@ function hasDurableCommitKnowledge(summary) {
   if (/no durable (knowledge|findings|memory|learning)/i.test(summary)) return false;
   if (/nothing durable (was )?(found|identified|detected)/i.test(summary)) return false;
   if (/heuristic fallback was used/i.test(summary)) return false;
+  if (/could not obtain a dedicated-model synthesis/i.test(summary)) return false;
   return true;
 }
-function writeMemory(cfg, repo, input, summary) {
+function writeMemory(cfg, repo, input, summary, modelStatus = "synthesized") {
   if (!hasDurableCommitKnowledge(summary)) return null;
   const root = obsidianRoot(cfg);
   const evidenceDir = path.join(root, "wiki", "evidence");
   mkdirSync(evidenceDir, { recursive: true });
   const evidenceFile = path.join(evidenceDir, `${slug(`commit-${input.sha.slice(0, 12)}`)}.md`);
-  writeFileSync(evidenceFile, ["---", `id: archivist-${input.sha.slice(0, 12)}`, "type: evidence", "source: git-commit", `commit: ${input.sha}`, `created: ${now()}`, `repo: ${path.basename(repo)}`, `model: ${cfg.model.provider}/${cfg.model.id}`, "model_status: synthesized", "---", "", `# Commit ${input.sha.slice(0, 12)}`, "", summary.trim(), ""].join("\n"));
+  writeFileSync(evidenceFile, ["---", `id: archivist-${input.sha.slice(0, 12)}`, "type: evidence", "source: git-commit", `commit: ${input.sha}`, `created: ${now()}`, `repo: ${path.basename(repo)}`, `model: ${cfg.model.provider}/${cfg.model.id}`, `model_status: ${modelStatus}`, "---", "", `# Commit ${input.sha.slice(0, 12)}`, "", summary.trim(), ""].join("\n"));
   upsertCatalogRow(repo, { id: `evidence.archivist-${input.sha.slice(0, 12)}`, scope: "project", project: path.basename(repo), type: "evidence", path: path.relative(repo, evidenceFile).replace(/\\/g, "/"), title: `Commit ${input.sha.slice(0, 12)}`, summary: `Archivist commit evidence for ${input.sha.slice(0, 12)}`, aliases: input.sha.slice(0, 12), tags: "archivist|git|commit", status: "active", confidence: "medium", updated: today(), based_on: input.sha, routes: input.files.join("|"), keywords: input.files.map(file => path.basename(file)).join("|") });
   const journalDir = path.join(root, "journal");
   mkdirSync(journalDir, { recursive: true });
@@ -481,7 +482,7 @@ try {
     }
     input.catalogRows = relevantCatalogRows(repo, [input.message, input.files.join("\n"), input.recent].join("\n"));
     const summary = await callModel(cfg, input);
-    const written = writeMemory(cfg, repo, input, summary);
+    const written = writeMemory(cfg, repo, input, summary, lastModelFallbackReason ? "fallback" : "synthesized");
     if (!written) {
       appendDocumentationJobLog(cfg, repo, { kind: "commit-ingest", status: lastModelFallbackReason ? "fallback" : "skipped", trigger: "post-commit-hook", commit: input.sha, queuedCommits: queuedShas, files: input.files, reason: lastModelFallbackReason || "no durable knowledge passed information-purity gate", highSignal: highSignalCommit(input), model: `${cfg.model.provider}/${cfg.model.id}` });
       console.log(`[archivist] skipped queued batch ${input.sha.slice(0, 12)} no durable knowledge`);

@@ -19,7 +19,7 @@ if (!existsSync(archivistDir)) {
 }
 
 console.log("▶ hook syntax");
-const syntax = Bun.spawnSync(["bun", "--syntax-check", path.join(archivistDir, "bin", "archivist-hook.mjs")], {
+const syntax = Bun.spawnSync(["node", "--check", path.join(archivistDir, "bin", "archivist-hook.mjs")], {
   cwd: archivistDir,
   stdout: "inherit",
   stderr: "inherit",

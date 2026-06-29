@@ -73,6 +73,20 @@ Older `memoryStore.surreal` config is accepted only as a backward-compatible Mem
 
 See `docs/INQUIRER_MEMORY_API.md`.
 
+## OKF interchange
+
+Archivist can convert OKF-like JSON artifacts into its canonical Markdown/frontmatter plus `catalog.csv` shape. OKF is treated as an import/export/interchange layer, not as a replacement for Obsidian Markdown or the catalog control plane.
+
+See `docs/OKF_INTEGRATION.md`.
+
+Useful smoke commands:
+
+```bash
+bun run test:okf
+bun run okf validate artifact.okf.json
+bun run okf to-md artifact.okf.json --path wiki/concepts/example.md
+```
+
 ## Commands
 
 - `/archivist:install-hook` — install async `.git/hooks/post-commit`

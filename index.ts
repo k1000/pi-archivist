@@ -3,11 +3,14 @@ import type { ExtensionAPI, ExtensionContext } from "@mariozechner/pi-coding-age
 import { Type, type Static } from "typebox";
 import { execFile } from "node:child_process";
 import { promisify } from "node:util";
-import { existsSync, mkdirSync, readFileSync, writeFileSync, appendFileSync, chmodSync, readdirSync, statSync } from "node:fs";
-import { homedir } from "node:os";
+import { existsSync, mkdirSync, readFileSync, writeFileSync, appendFileSync, chmodSync, readdirSync, statSync, copyFileSync } from "node:fs";
 import path from "node:path";
 import { createHash } from "node:crypto";
 import { createAutoMemoryState, hashAutoMemory, stringifyForAutoMemory, type AutoMemoryState } from "../pi-sherpa/lib/auto-memory";
+import { DEFAULT_ARCHIVIST_CONFIG, loadConfig, obsidianMemoryPath, type ArchivistConfig } from "./lib/config";
+import { appendDocumentationJobLog, documentationJobLogPath } from "./lib/job-log";
+import { archivistMemoryApiConfig, archivistMemoryStore, ingestObsidianDocumentToMemoryApi, memoryApiGet, recordMemoryIngestFailure, triggerObsidianDocumentIngest, triggerObsidianDocumentsFromSyncResult, type MemoryApiStore, type MemoryArtifact, type RetrievalFeedbackRecord } from "./lib/memory-api";
+import { formatFrontmatter, titleFromMarkdown } from "./lib/markdown-note";
 import { modelSessionAnalysis, writeSessionFindings } from "./lib/session-analysis";
 import { prepareDocumentChunks, requestEmbeddings, splitTextChunks } from "./lib/document-chunks";
 import { parseGitStatusFiles, parseReflectSyncArgs } from "../pi-sherpa/lib/common";
@@ -15,271 +18,14 @@ import { parseGitStatusFiles, parseReflectSyncArgs } from "../pi-sherpa/lib/comm
 import { createAutomationState, discoverRunnableAutomations, findRunnableAutomation, formatRunnableAutomation, recordAutomationRun, updateAutomationCandidates, type AutomationState } from "../pi-sherpa/lib/automation";
 import { evaluatePersistence } from "../pi-sherpa/lib/preserve";
 import { syncReflectMemory } from "../pi-sherpa/lib/memory";
-import { writeDistilledSkill } from "../pi-sherpa/lib/distillation";
+import { writeDistilledSkill } from "./lib/distillation";
 import { auditCatalog, catalogMatches, readProjectCatalog, resolveCatalogPath, upsertCatalogRow } from "../pi-sherpa/lib/catalog";
 import type { CatalogRow } from "../pi-sherpa/lib/catalog";
-import { MemoryApiStore, type MemoryArtifact, type RetrievalFeedbackRecord } from "../pi-sherpa/lib/memory-store";
 
 const execFileAsync = promisify(execFile);
 const TECH_DOC_WRITER_SKILL_PATH = "/Users/kamil/Development/_DESERT_BACON/ClearStack/.claude/skills/technical-docs-writer/SKILL.md";
 
-const DEFAULT_ARCHIVIST_CONFIG = {
-  enabled: true,
-  commitHook: { enabled: true, async: true, recentCommitCount: 12 },
-  model: {
-    provider: "minimax",
-    id: "MiniMax-M2.7-highspeed",
-    useMainPiModel: false,
-    heuristicOnly: false,
-    fallbackToHeuristics: true,
-  },
-  memory: {
-    obsidianVault: "/Users/kamil/Documents/articles",
-    obsidianMemoryPath: "projects/project",
-    scratchpadPath: ".pi-memory/scratchpad",
-  },
-  repoDocs: { mode: "propose" },
-  documentationJobs: {
-    logPath: ".pi-memory/archivist-documentation-jobs.jsonl",
-  },
-  researchLinks: {
-    sageSourceId: "source.fe51221f6743ee52",
-  },
-  // Archivist writes durable Markdown to Obsidian, then mirrors it through
-  // the Inquirer Memory API. The API owns the backing database; Archivist does
-  // not connect to SurrealDB or any local database directly.
-  memoryApi: {
-    enabled: true,
-    mode: "memory-api",
-    url: "https://api.enquirer.app",
-    namespace: "pi",
-    database: "memory",
-    tokenEnv: "SHERPA_MEMORY_API_TOKEN",
-  },
-};
-
-type ArchivistConfig = typeof DEFAULT_ARCHIVIST_CONFIG & {
-  memoryApi?: MemoryApiStoreConfig;
-};
 type DocumentationModelRuntime = { modelRegistry: ExtensionContext["modelRegistry"]; signal: AbortSignal };
-type ArchivistNotify = (message: string, level?: "info" | "success" | "warning" | "error") => void;
-
-function createSafeNotifier(ctx: ExtensionContext): ArchivistNotify | undefined {
-  try {
-    if (!ctx.hasUI) return undefined;
-    const ui = ctx.ui;
-    return (message, level = "info") => {
-      try { ui.notify(message, level); } catch { /* UI may disappear during session reload/shutdown. */ }
-    };
-  } catch {
-    return undefined;
-  }
-}
-
-function sendArchivistMessage(pi: ExtensionAPI, message: Parameters<ExtensionAPI["sendMessage"]>[0]) {
-  try { pi.sendMessage(message, { triggerTurn: false }); } catch { /* Extension runner may be stale after reload/session replacement. */ }
-}
-
-function mergeConfig<T>(base: T, over: any): T {
-  if (!over || typeof over !== "object") return structuredClone(base);
-  const out: any = Array.isArray(base) ? [...base] : { ...(base as any) };
-  for (const [k, v] of Object.entries(over)) {
-    out[k] = v && typeof v === "object" && !Array.isArray(v) ? mergeConfig((base as any)?.[k] ?? {}, v) : v;
-  }
-  return out;
-}
-
-function projectMemoryRel(cwd: string) {
-  const name = path.basename(cwd).replace(/[^A-Za-z0-9_-]+/g, "-") || "project";
-  return `projects/${name}`;
-}
-
-function readJsonIfExists(file: string) {
-  try { return existsSync(file) ? JSON.parse(readFileSync(file, "utf8")) : undefined; }
-  catch { return undefined; }
-}
-
-function loadConfig(cwd: string): ArchivistConfig {
-  const cfg = structuredClone(DEFAULT_ARCHIVIST_CONFIG);
-  cfg.memory.obsidianMemoryPath = projectMemoryRel(cwd);
-
-  // Reuse Sherpa's existing memory configuration as the base contract.
-  // Do not inherit Sherpa's model: Archivist must stay on its own dedicated
-  // lower model (default: minimax/MiniMax-M2.7-highspeed) unless explicitly
-  // overridden by .pi/archivist.config.json.
-  const globalSherpa = readJsonIfExists(path.join(process.env.HOME || "/Users/kamil", ".pi", "sherpa.config.json"));
-  const projectSherpa = readJsonIfExists(path.join(cwd, ".pi", "sherpa.config.json"));
-  for (const sherpa of [globalSherpa, projectSherpa]) {
-    if (sherpa?.memory) (cfg as any).memory = mergeConfig(cfg.memory, sherpa.memory);
-    // Archivist uses memoryApi config; it does not inherit memoryStore from Sherpa.
-  }
-
-  const projectArchivist = readJsonIfExists(path.join(cwd, ".pi", "archivist.config.json"));
-  return mergeConfig(cfg, projectArchivist);
-}
-
-function obsidianMemoryPath(cfg: ArchivistConfig) {
-  const configured = cfg.memory.obsidianMemoryPath || DEFAULT_ARCHIVIST_CONFIG.memory.obsidianMemoryPath;
-  return path.isAbsolute(configured) ? configured : path.join(cfg.memory.obsidianVault, configured);
-}
-
-function archivistMemoryApiConfig(cfg: ArchivistConfig): MemoryApiStoreConfig {
-  return cfg.memoryApi ?? DEFAULT_ARCHIVIST_CONFIG.memoryApi;
-}
-
-function archivistMemoryStore(cfg: ArchivistConfig) {
-  const memoryCfg = archivistMemoryApiConfig(cfg);
-  return memoryCfg.enabled ? new MemoryApiStore(memoryCfg) : undefined;
-}
-
-async function mirrorArtifactToMemoryApi(cfg: ArchivistConfig, artifact: MemoryArtifact) {
-  const store = archivistMemoryStore(cfg);
-  if (!store) return;
-  await store.writeArtifact(artifact).catch(() => undefined);
-}
-
-function cloudflareAccessCookie(url: string): string | undefined {
-  try {
-    const host = new URL(url).hostname;
-    const dir = path.join(homedir(), ".cloudflared");
-    if (!existsSync(dir)) return undefined;
-    const tokenFile = readdirSync(dir).find((name) => name.startsWith(`${host}-`) && name.endsWith("-token"));
-    if (!tokenFile) return undefined;
-    const token = readFileSync(path.join(dir, tokenFile), "utf8").trim();
-    return token ? `CF_Authorization=${token}` : undefined;
-  } catch {
-    return undefined;
-  }
-}
-
-function memoryApiHeaders(cfg: ArchivistConfig): Record<string, string> {
-  const headers: Record<string, string> = { Accept: "application/json", "Content-Type": "application/json" };
-  const memoryCfg = archivistMemoryApiConfig(cfg);
-  const token = (memoryCfg as any).token
-    || ((memoryCfg as any).tokenEnv ? process.env[(memoryCfg as any).tokenEnv] : undefined)
-    || process.env.SHERPA_MEMORY_API_TOKEN
-    || process.env.MEMORY_API_TOKEN
-    || (memoryCfg.url.includes("127.0.0.1") || memoryCfg.url.includes("localhost") ? "dev-token" : undefined);
-  if (token) headers.Authorization = `Bearer ${token}`;
-  const cfCookie = cloudflareAccessCookie(memoryCfg.url);
-  if (cfCookie) headers.Cookie = cfCookie;
-  return headers;
-}
-
-async function memoryApiGet(cfg: ArchivistConfig, path: string) {
-  const memoryCfg = archivistMemoryApiConfig(cfg);
-  if (!memoryCfg.enabled) throw new Error("memory API mirror is disabled");
-  const response = await fetch(`${memoryCfg.url.replace(/\/$/, "")}${path}`, {
-    headers: memoryApiHeaders(cfg),
-    signal: AbortSignal.timeout(5000),
-  });
-  if (!response.ok) throw new Error(`memory API ${response.status}: ${await response.text()}`);
-  return await response.json();
-}
-
-async function memoryApiPost(cfg: ArchivistConfig, apiPath: string, body: unknown) {
-  const memoryCfg = archivistMemoryApiConfig(cfg);
-  if (!memoryCfg.enabled) throw new Error("memory API mirror is disabled");
-  const response = await fetch(`${memoryCfg.url.replace(/\/$/, "")}${apiPath}`, {
-    method: "POST",
-    headers: memoryApiHeaders(cfg),
-    body: JSON.stringify(body),
-    signal: AbortSignal.timeout(10000),
-  });
-  if (!response.ok) throw new Error(`memory API ${response.status}: ${await response.text()}`);
-  return await response.json();
-}
-
-async function ingestObsidianDocumentToMemoryApi(cfg: ArchivistConfig, cwd: string, file: string) {
-  const memoryCfg = archivistMemoryApiConfig(cfg);
-  if (!memoryCfg.enabled) return { ingested: false, reason: "memory API mirror is disabled" };
-  if (!file.endsWith(".md")) return { ingested: false, reason: "not a markdown document" };
-  const resolved = path.resolve(file);
-  if (!existsSync(resolved) || !statSync(resolved).isFile()) return { ingested: false, reason: `document not found: ${file}` };
-  const project = path.basename(cwd);
-  const vault = path.resolve(cfg.memory.obsidianVault);
-  const rel = path.relative(vault, resolved).replace(/\\/g, "/");
-  if (!rel.startsWith("..") && !path.isAbsolute(rel)) {
-    await memoryApiPost(cfg, "/api/v1/memory/ingest-vault", {
-      vaultPath: vault,
-      includePaths: [rel],
-      limit: 1,
-      dryRun: false,
-      scope: "project",
-      project,
-      tags: ["obsidian", "vault-ingest", "archivist"],
-    });
-    return { ingested: true, path: rel, mode: "vault" };
-  }
-
-  const raw = readFileSync(resolved, "utf8");
-  const title = titleFromMarkdown(raw, path.basename(resolved, ".md"));
-  const artifactId = stableMemoryId("archivist-note", resolved);
-  await memoryApiPost(cfg, "/api/v1/memory/ingest", {
-    artifact: {
-      id: artifactId,
-      scope: "project",
-      project,
-      type: "obsidian-note",
-      title,
-      text: raw.slice(0, 24000),
-      sourcePath: resolved,
-      sourceHash: createHash("sha256").update(raw).digest("hex"),
-      confidence: "medium",
-      status: "active",
-      tags: ["obsidian", "archivist"],
-      aliases: [title, path.basename(resolved)],
-      routes: [resolved],
-      keywords: [title, path.basename(resolved)],
-    },
-    sourceText: raw,
-  });
-  return { ingested: true, path: resolved, mode: "direct" };
-}
-
-function recordMemoryIngestFailure(cwd: string, file: string, error: unknown) {
-  try {
-    const logFile = path.join(cwd, ".pi-memory", "archivist-inquirer-ingest-failures.jsonl");
-    mkdirSync(path.dirname(logFile), { recursive: true });
-    const message = error instanceof Error ? error.message : String(error);
-    appendFileSync(logFile, `${JSON.stringify({ at: nowIso(), file, error: message })}\n`);
-    // Also emit to stderr so failures are visible in extension logs. Do not
-    // create an Obsidian inbox note here: that could recurse into another ingest.
-    console.warn(`[archivist] Inquirer ingest failed for ${file}: ${message}`);
-  } catch {
-    // Last-resort best effort only; do not break the primary Archivist write.
-  }
-}
-
-function triggerObsidianDocumentIngest(cfg: ArchivistConfig, cwd: string, file: string | null | undefined) {
-  if (!file) return;
-  void ingestObsidianDocumentToMemoryApi(cfg, cwd, file).catch((error) => recordMemoryIngestFailure(cwd, file, error));
-}
-
-function triggerObsidianDocumentsFromSyncResult(cfg: ArchivistConfig, cwd: string, syncResult: string) {
-  for (const match of syncResult.matchAll(/->\s+([^\n]+\.md)\b/g)) {
-    const rawPath = match[1]?.trim();
-    if (!rawPath || rawPath.includes(" (dry-run)")) continue;
-    triggerObsidianDocumentIngest(cfg, cwd, path.resolve(cwd, rawPath));
-  }
-}
-
-function documentationJobLogPath(cfg: ArchivistConfig, cwd: string) {
-  const configured = cfg.documentationJobs?.logPath || DEFAULT_ARCHIVIST_CONFIG.documentationJobs.logPath;
-  return path.isAbsolute(configured) ? configured : path.join(cwd, configured);
-}
-
-function appendDocumentationJobLog(cfg: ArchivistConfig, cwd: string, event: Record<string, unknown>) {
-  try {
-    const target = documentationJobLogPath(cfg, cwd);
-    mkdirSync(path.dirname(target), { recursive: true });
-    appendFileSync(target, `${JSON.stringify({ schemaVersion: 1, at: nowIso(), project: path.basename(cwd), pid: process.pid, ...event })}\n`);
-  } catch (error) {
-    const message = error instanceof Error ? error.message : String(error);
-    console.warn(`[archivist] documentation job log failed: ${message}`);
-  }
-}
-
 function summarizeFeedbackForReview(feedback: RetrievalFeedbackRecord[]) {
   const missing = new Map<string, number>();
   const noisy = new Map<string, number>();
@@ -1272,10 +1018,6 @@ function normalizeModelMarkdown(text: string) {
   return (fenced?.[1] ?? trimmed).trim();
 }
 
-function titleFromMarkdown(text: string, fallback: string) {
-  return text.match(/^#\s+(.+)$/m)?.[1]?.trim().slice(0, 160) || fallback;
-}
-
 function researchAreaFromPath(file: string) {
   const parts = file.replace(/\\/g, "/").split("/");
   const idx = parts.lastIndexOf("research");
@@ -1513,11 +1255,6 @@ function semanticPreserveType(type: string) {
   return { folder: "concepts", pageType: "concept" };
 }
 
-function yamlScalar(value: unknown): string {
-  if (Array.isArray(value)) return `[${value.map((item) => JSON.stringify(String(item))).join(", ")}]`;
-  return JSON.stringify(String(value ?? ""));
-}
-
 function formatPreserveNote(params: PreserveParams, pageType: string): string {
   const frontmatter: Record<string, unknown> = {
     id: params.refId,
@@ -1528,9 +1265,7 @@ function formatPreserveNote(params: PreserveParams, pageType: string): string {
     created: nowIso(),
   };
   return [
-    "---",
-    ...Object.entries(frontmatter).map(([key, value]) => `${key}: ${yamlScalar(value)}`),
-    "---",
+    formatFrontmatter(frontmatter),
     "",
     `# ${params.title}`,
     "",
@@ -2076,18 +1811,23 @@ export default function (pi: ExtensionAPI) {
       const hookPath = path.isAbsolute(gitDir) ? path.join(gitDir, "hooks", "post-commit") : path.join(ctx.cwd, gitDir, "hooks", "post-commit");
       const hookScript = path.join(path.dirname(__filename), "bin", "archivist-hook.mjs");
       mkdirSync(path.dirname(hookPath), { recursive: true });
+      const existingHook = existsSync(hookPath) ? readFileSync(hookPath, "utf8") : "";
+      const backupPath = existingHook.trim() && !existingHook.includes("archivist-hook.mjs") ? `${hookPath}.pre-archivist-${Date.now()}` : undefined;
+      if (backupPath) copyFileSync(hookPath, backupPath);
       const block = [
         "#!/bin/sh",
         "# Installed by pi Archivist extension. Runs asynchronously and never blocks commits.",
+        backupPath ? `if [ -x ${JSON.stringify(backupPath)} ]; then ${JSON.stringify(backupPath)} \"$@\" || exit $?; fi` : undefined,
         "if [ -n \"$ARCHIVIST_SKIP\" ]; then exit 0; fi",
         "if command -v bun >/dev/null 2>&1; then ARCHIVIST_RUNTIME=bun; else ARCHIVIST_RUNTIME=node; fi",
         `ARCHIVIST_SKIP=1 \"$ARCHIVIST_RUNTIME\" ${JSON.stringify(hookScript)} --repo \"$(git rev-parse --show-toplevel)\" --commit HEAD >> \"$(git rev-parse --git-dir)/archivist.log\" 2>&1 &`,
         "exit 0",
         "",
-      ].join("\n");
+      ].filter((line): line is string => Boolean(line)).join("\n");
       writeFileSync(hookPath, block);
       chmodSync(hookPath, 0o755);
-      ctx.ui.notify(`Archivist post-commit hook installed: ${hookPath}`, "success");
+      if (backupPath) chmodSync(backupPath, 0o755);
+      ctx.ui.notify(`Archivist post-commit hook installed: ${hookPath}${backupPath ? ` (existing hook backed up to ${backupPath})` : ""}`, "success");
     } catch (e: any) {
       ctx.ui.notify(`Archivist hook install failed: ${e.message ?? e}`, "error");
     }
