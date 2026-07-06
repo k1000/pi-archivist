@@ -13,6 +13,7 @@ import { fileURLToPath } from "node:url";
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 const archivistDir = path.resolve(__dirname, "..");
+const bun = process.execPath;
 
 if (!existsSync(archivistDir)) {
   throw new Error(`Archivist extension directory not found: ${archivistDir}`);
@@ -27,7 +28,7 @@ const syntax = Bun.spawnSync(["node", "--check", path.join(archivistDir, "bin", 
 if (syntax.exitCode !== 0) process.exit(syntax.exitCode);
 
 console.log("▶ hook help");
-const help = Bun.spawnSync(["bun", path.join(archivistDir, "bin", "archivist-hook.mjs"), "--help"], {
+const help = Bun.spawnSync([bun, path.join(archivistDir, "bin", "archivist-hook.mjs"), "--help"], {
   cwd: archivistDir,
   stdout: "inherit",
   stderr: "inherit",

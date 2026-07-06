@@ -5,6 +5,7 @@ import os from "node:os";
 import path from "node:path";
 
 const root = path.resolve(import.meta.dir, "..");
+const bun = process.execPath;
 const hook = readFileSync(path.join(root, "bin", "archivist-hook.mjs"), "utf8");
 const check = readFileSync(path.join(root, "scripts", "check-extension.ts"), "utf8");
 const index = readFileSync(path.join(root, "index.ts"), "utf8");
@@ -35,7 +36,7 @@ try {
   execFileSync("git", ["add", "."], { cwd: repo });
   execFileSync("git", ["commit", "-m", "feat(api): change public contract"], { cwd: repo, stdio: "ignore" });
 
-  execFileSync("bun", [path.join(root, "bin", "archivist-hook.mjs"), "--repo", repo, "--commit", "HEAD"], { cwd: repo, stdio: "ignore" });
+  execFileSync(bun, [path.join(root, "bin", "archivist-hook.mjs"), "--repo", repo, "--commit", "HEAD"], { cwd: repo, stdio: "ignore" });
   const evidenceDir = path.join(tmp, "vault", "projects", "repo", "wiki", "evidence");
   assert.equal(existsSync(evidenceDir) ? readdirSync(evidenceDir).length : 0, 0, "heuristic-only fallback must not write durable evidence");
   const jobLog = readFileSync(path.join(repo, ".pi-memory", "archivist-documentation-jobs.jsonl"), "utf8");

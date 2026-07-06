@@ -5,6 +5,12 @@ import { createHash } from "node:crypto";
 import { DEFAULT_ARCHIVIST_CONFIG, type ArchivistConfig } from "./config";
 import { titleFromMarkdown } from "./markdown-note";
 
+// Errors are logged via console.warn rather than swallowed silently.
+// Callers that deliberately want silent-fail behaviour use this marker.
+export function apiSilent<T>(): (e: unknown) => T {
+  return (e: unknown) => { try { console.warn("[archivist-api] write failed:", e instanceof Error ? e.message : String(e)); } catch {} return undefined as T; };
+}
+
 export type MemoryArtifact = Record<string, unknown> & {
   id: string;
   scope?: string;

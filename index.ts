@@ -61,7 +61,7 @@ async function writeFeedbackReviewToMemoryApi(store: MemoryApiStore, cfg: Archiv
     keywords: ["feedback", "missing context", "noisy artifacts", "graph review"],
     createdAt: now,
     updatedAt: now,
-  }).catch(() => undefined);
+  }).catch(() => console.warn("[archivist] write failed"));
 
   for (const [missingPath] of summary.missing.slice(0, 12)) {
     const fileId = sourceFileArtifactId(missingPath);
@@ -82,12 +82,12 @@ async function writeFeedbackReviewToMemoryApi(store: MemoryApiStore, cfg: Archiv
       keywords: [missingPath, path.basename(missingPath)],
       createdAt: now,
       updatedAt: now,
-    }).catch(() => undefined);
-    await store.writeRelation({ from: reviewId, relation: "related", to: fileId, confidence: "low", source: inboxPath, createdAt: now }).catch(() => undefined);
+    }).catch(() => console.warn("[archivist] write failed"));
+    await store.writeRelation({ from: reviewId, relation: "related", to: fileId, confidence: "low", source: inboxPath, createdAt: now }).catch(() => console.warn("[archivist] relation write failed"));
   }
 
   for (const [noisyId] of summary.noisy.slice(0, 12)) {
-    await store.writeRelation({ from: reviewId, relation: "related", to: noisyId, confidence: "low", source: inboxPath, createdAt: now }).catch(() => undefined);
+    await store.writeRelation({ from: reviewId, relation: "related", to: noisyId, confidence: "low", source: inboxPath, createdAt: now }).catch(() => console.warn("[archivist] relation write failed"));
   }
 }
 
@@ -957,8 +957,8 @@ async function writeDocumentChunks(store: MemoryApiStore, cfg: ArchivistConfig, 
   const chunks = splitTextChunks(sourceText);
   const embeddings = await requestEmbeddings(chunks);
   const prepared = prepareDocumentChunks({ artifact, sourceText, embeddings, createdAt: nowIso() });
-  for (const chunk of prepared.chunks) await store.writeChunk?.(chunk).catch(() => undefined);
-  for (const relation of prepared.relations) await store.writeRelation(relation).catch(() => undefined);
+  for (const chunk of prepared.chunks) await store.writeChunk?.(chunk).catch(() => console.warn("[archivist] chunk write failed"));
+  for (const relation of prepared.relations) await store.writeRelation(relation).catch(() => console.warn("[archivist] relation write failed"));
   return { chunks: chunks.length, embeddings: embeddings.length };
 }
 
@@ -992,8 +992,8 @@ async function writeEntityMentions(store: MemoryApiStore, project: string, fromI
       keywords: [entity],
       createdAt: now,
       updatedAt: now,
-    }).catch(() => undefined);
-    await store.writeRelation({ from: fromId, relation: "mentions", to: entityId, confidence: "medium", source, createdAt: now }).catch(() => undefined);
+    }).catch(() => console.warn("[archivist] write failed"));
+    await store.writeRelation({ from: fromId, relation: "mentions", to: entityId, confidence: "medium", source, createdAt: now }).catch(() => console.warn("[archivist] write failed"));
   }
 }
 
@@ -1091,8 +1091,8 @@ async function writeSourceDocumentClaims(store: ReturnType<typeof archivistMemor
       keywords: claim.split(/\W+/).filter((word) => word.length > 4).slice(0, 16),
       createdAt: ctx.now,
       updatedAt: ctx.now,
-    }).catch(() => undefined);
-    await store.writeRelation({ from: ctx.artifactId, relation: "supports", to: claimId, confidence: "medium", source: resolved, createdAt: ctx.now }).catch(() => undefined);
+    }).catch(() => console.warn("[archivist] write failed"));
+    await store.writeRelation({ from: ctx.artifactId, relation: "supports", to: claimId, confidence: "medium", source: resolved, createdAt: ctx.now }).catch(() => console.warn("[archivist] write failed"));
     await writeEntityMentions(store, ctx.project ?? path.basename(cwd), claimId, claim, resolved, ctx.now);
     claims++;
   }
@@ -1138,7 +1138,7 @@ async function mirrorCommitEvidenceToMemoryApi(cfg: ArchivistConfig, cwd: string
     keywords: files.map((file) => path.basename(file)),
     createdAt: now,
     updatedAt: now,
-  }).catch(() => undefined);
+  }).catch(() => console.warn("[archivist] write failed"));
 
   await writeEntityMentions(store, project, written.id, written.summary, commit, now);
 
@@ -1161,7 +1161,7 @@ async function mirrorCommitEvidenceToMemoryApi(cfg: ArchivistConfig, cwd: string
       keywords: [file, path.basename(file), path.dirname(file)],
       createdAt: now,
       updatedAt: now,
-    }).catch(() => undefined);
+    }).catch(() => console.warn("[archivist] write failed"));
     await store.writeRelation({
       from: written.id,
       relation: "based_on",
@@ -1169,7 +1169,7 @@ async function mirrorCommitEvidenceToMemoryApi(cfg: ArchivistConfig, cwd: string
       confidence: "high",
       source: commit,
       createdAt: now,
-    }).catch(() => undefined);
+    }).catch(() => console.warn("[archivist] write failed"));
   }
 
   if (cfg.researchLinks.sageSourceId && /\b(SAGE|GraphRAG|agent memory|graph memory|memory API)\b/i.test(written.summary)) {
@@ -1180,7 +1180,7 @@ async function mirrorCommitEvidenceToMemoryApi(cfg: ArchivistConfig, cwd: string
       confidence: "medium",
       source: commit,
       createdAt: now,
-    }).catch(() => undefined);
+    }).catch(() => console.warn("[archivist] write failed"));
   }
 
   for (const claim of extractSourceGroundedClaims(written.summary)) {
@@ -1203,7 +1203,7 @@ async function mirrorCommitEvidenceToMemoryApi(cfg: ArchivistConfig, cwd: string
       keywords: [...files.map((file) => path.basename(file)), ...claim.split(/\W+/).filter((word) => word.length > 4).slice(0, 12)],
       createdAt: now,
       updatedAt: now,
-    }).catch(() => undefined);
+    }).catch(() => console.warn("[archivist] write failed"));
     await store.writeRelation({
       from: written.id,
       relation: "supports",
@@ -1211,7 +1211,7 @@ async function mirrorCommitEvidenceToMemoryApi(cfg: ArchivistConfig, cwd: string
       confidence: "medium",
       source: commit,
       createdAt: now,
-    }).catch(() => undefined);
+    }).catch(() => console.warn("[archivist] write failed"));
     await writeEntityMentions(store, project, claimId, claim, commit, now);
   }
 }
