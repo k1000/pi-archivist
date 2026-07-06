@@ -7,7 +7,7 @@ Archivist is the write-side partner to Sherpa.
 
 Archivist reuses Sherpa configuration where possible:
 
-- model defaults from `.pi/sherpa.config.json` or `~/.pi/sherpa.config.json`
+- dedicated lower model defaults to `deepseek/deepseek-v4-flash` unless `.pi/archivist.config.json` or `~/.pi/archivist.config.json` overrides it
 - memory paths from Sherpa's `memory` config
 - Obsidian directory ontology: `wiki/systems`, `wiki/procedures`, `wiki/decisions`, `wiki/concepts`, `wiki/evidence`, `journal`, `inbox` — plus `wiki/procedures/user-corrections.md` for user behavior corrections and `wiki/procedures/user-profile.md` for cross-session preferences
 - `catalog.csv` as the catalog service/navigation surface for documentation locations
@@ -19,8 +19,8 @@ Archivist never uses the main Pi model. It uses its configured lower model:
 ```json
 {
   "model": {
-    "provider": "minimax",
-    "id": "MiniMax-M2.7-highspeed",
+    "provider": "deepseek",
+    "id": "deepseek-v4-flash",
     "useMainPiModel": false
   }
 }

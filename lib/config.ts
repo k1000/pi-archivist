@@ -5,8 +5,8 @@ export const DEFAULT_ARCHIVIST_CONFIG = {
   enabled: true,
   commitHook: { enabled: true, async: true, recentCommitCount: 12 },
   model: {
-    provider: "minimax",
-    id: "MiniMax-M2.7-highspeed",
+    provider: "deepseek",
+    id: "deepseek-v4-flash",
     useMainPiModel: false,
     heuristicOnly: false,
     fallbackToHeuristics: true,

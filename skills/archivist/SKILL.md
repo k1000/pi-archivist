@@ -110,8 +110,8 @@ Keep the model dedicated/lower, for example:
 ```json
 {
   "model": {
-    "provider": "minimax",
-    "id": "MiniMax-M2.7-highspeed",
+    "provider": "deepseek",
+    "id": "deepseek-v4-flash",
     "useMainPiModel": false
   },
   "documentationJobs": {

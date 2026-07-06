@@ -12,7 +12,7 @@ const TECH_DOC_WRITER_SKILL_PATH = "/Users/kamil/Development/_DESERT_BACON/Clear
 const DEFAULT = {
   enabled: true,
   commitHook: { enabled: true, async: true, recentCommitCount: 12 },
-  model: { provider: "minimax", id: "MiniMax-M2.7-highspeed", heuristicOnly: false, fallbackToHeuristics: true, useMainPiModel: false },
+  model: { provider: "deepseek", id: "deepseek-v4-flash", heuristicOnly: false, fallbackToHeuristics: true, useMainPiModel: false },
   memory: { obsidianVault: "/Users/kamil/Documents/articles", obsidianMemoryPath: "projects/project", scratchpadPath: ".pi-memory/scratchpad" },
   documentationJobs: { logPath: ".pi-memory/archivist-documentation-jobs.jsonl" },
 };
@@ -33,7 +33,7 @@ function loadConfig(repo) {
     // lower model unless explicitly overridden by .pi/archivist.config.json.
     if (sherpa?.memory) cfg.memory = merge(cfg.memory, sherpa.memory);
   }
-  return merge(cfg, readJson(path.join(repo, ".pi", "archivist.config.json")));
+  return merge(merge(cfg, readJson(path.join(os.homedir(), ".pi", "archivist.config.json"))), readJson(path.join(repo, ".pi", "archivist.config.json")));
 }
 async function git(repo, args) { const { stdout } = await execFile("git", args, { cwd: repo, maxBuffer: 4 * 1024 * 1024 }); return stdout.trim(); }
 function today() { return new Date().toISOString().slice(0, 10); }
