@@ -49,10 +49,13 @@ export class MemoryApiStore {
 
   async search(query: { text: string; limit?: number }): Promise<Array<{ artifact: MemoryArtifact; score?: number }>> {
     try {
-      const params = new URLSearchParams({ q: query.text, limit: String(query.limit ?? 10) });
-      const result = await memoryApiGetRaw(this.cfg, `/api/v1/memory/search?${params.toString()}`);
+      const result = await memoryApiPostRaw(this.cfg, "/api/v1/memory/search", {
+        text: query.text,
+        limit: query.limit ?? 10,
+      });
       return Array.isArray(result?.results) ? result.results : Array.isArray(result) ? result : [];
-    } catch {
+    } catch (error) {
+      console.warn(`[archivist-api] search failed: ${error instanceof Error ? error.message : String(error)}`);
       return [];
     }
   }
@@ -81,10 +84,17 @@ export function archivistMemoryStore(cfg: ArchivistConfig): MemoryApiStore | und
   return memoryCfg.enabled ? new MemoryApiStore(memoryCfg) : undefined;
 }
 
-export async function mirrorArtifactToMemoryApi(cfg: ArchivistConfig, artifact: MemoryArtifact): Promise<void> {
+export async function mirrorArtifactToMemoryApi(cfg: ArchivistConfig, artifact: MemoryArtifact, cwd?: string): Promise<void> {
   const store = archivistMemoryStore(cfg);
   if (!store) return;
-  await store.writeArtifact(artifact).catch(() => undefined);
+  try {
+    await store.writeArtifact(artifact);
+  } catch (error) {
+    const id = String(artifact.id ?? "(unknown)");
+    const source = String((artifact as any).sourcePath ?? artifact.title ?? id);
+    console.warn(`[archivist] memory API artifact mirror failed id=${id}: ${error instanceof Error ? error.message : String(error)}`);
+    if (cwd) recordMemoryIngestFailure(cwd, source, error);
+  }
 }
 
 function cloudflareAccessCookie(url: string): string | undefined {
@@ -112,6 +122,21 @@ function memoryApiHeadersForConfig(memoryCfg: ArchivistMemoryApiConfig): Record<
   const cfCookie = cloudflareAccessCookie(memoryCfg.url);
   if (cfCookie) headers.Cookie = cfCookie;
   return headers;
+}
+
+export function memoryApiAuthStatus(cfg: ArchivistConfig): { configured: boolean; source: string; tokenEnv?: string } {
+  const memoryCfg = archivistMemoryApiConfig(cfg) as any;
+  if (!memoryCfg.enabled) return { configured: false, source: "disabled", tokenEnv: memoryCfg.tokenEnv };
+  if (typeof memoryCfg.token === "string" && memoryCfg.token.length > 0) return { configured: true, source: "config.token" };
+  if (memoryCfg.url.includes("127.0.0.1") || memoryCfg.url.includes("localhost")) return { configured: true, source: "localhost-dev-token", tokenEnv: memoryCfg.tokenEnv };
+  if (typeof memoryCfg.tokenEnv === "string" && memoryCfg.tokenEnv.length > 0) {
+    return process.env[memoryCfg.tokenEnv]
+      ? { configured: true, source: `tokenEnv:${memoryCfg.tokenEnv}`, tokenEnv: memoryCfg.tokenEnv }
+      : { configured: false, source: "none", tokenEnv: memoryCfg.tokenEnv };
+  }
+  if (process.env.SHERPA_MEMORY_API_TOKEN) return { configured: true, source: "SHERPA_MEMORY_API_TOKEN" };
+  if (process.env.MEMORY_API_TOKEN) return { configured: true, source: "MEMORY_API_TOKEN" };
+  return { configured: false, source: "none", tokenEnv: memoryCfg.tokenEnv };
 }
 
 export function memoryApiHeaders(cfg: ArchivistConfig): Record<string, string> {

@@ -1364,10 +1364,92 @@ type RunAutomationParams = Static<typeof runAutomationSchema>;
 export default function (pi: ExtensionAPI) {
   let state: ArchivistState = createArchivistState();
 
+  function sendArchivistMessage(message: Parameters<ExtensionAPI["sendMessage"]>[0]) {
+    try { pi.sendMessage(message, { triggerTurn: false }); } catch { /* Extension runner may be stale after reload/session replacement. */ }
+  }
+
   // Deliberately do not run Archivist maintenance on every agent/task end.
   // Archivist is session-level/commit-hook maintenance, not part of the main
   // agent's per-task critical path.
   pi.on("agent_end", async (_event, _ctx) => {});
+
+  /**
+   * Resolve model auth for Archivist's sidecar model.
+   */
+  async function resolveArchivistModelAuth(cfg: ArchivistConfig, runtime: { modelRegistry: ExtensionContext["modelRegistry"] }): Promise<{ model: { provider: string; id: string; api: string; baseUrl?: string }; auth: { apiKey: string; headers?: Record<string, string> } } | null> {
+    if (cfg.model.heuristicOnly) return null;
+    const model = runtime.modelRegistry.find(cfg.model.provider, cfg.model.id);
+    if (!model) return null;
+    const auth = await runtime.modelRegistry.getApiKeyAndHeaders(model);
+    if (!auth.ok || !auth.apiKey) return null;
+    return { model: { provider: cfg.model.provider, id: cfg.model.id, api: model.api, baseUrl: model.baseUrl }, auth: { apiKey: auth.apiKey, headers: auth.headers } };
+  }
+
+  /**
+   * Run Archivist's session analysis in a background subprocess so Pi TUI stays responsive.
+   */
+  function runBackgroundSessionAnalysis(cfg: ArchivistConfig, cwd: string, reason: string, rawText: string, ctx: ExtensionContext) {
+    const notify = createSafeNotifier(ctx);
+    const workerScript = path.join(path.dirname(__filename), "..", "pi-sherpa", "scripts", "background-model-worker.ts");
+
+    resolveArchivistModelAuth(cfg, { modelRegistry: ctx.modelRegistry }).then((modelAuth) => {
+      if (!modelAuth) {
+        // heuristicOnly: skip session analysis
+        return;
+      }
+
+      const systemPrompt = [
+        "You are Archivist, the write-side partner to Sherpa.",
+        "You are a guardian of information purity: protect durable memory from noise, clutter, no-op records, and low-value audit chatter.",
+        "You analyze coding session content and extract durable knowledge worth preserving.",
+        "",
+        "Extract ONLY findings that would still matter in 3 months and would make a future user/agent glad the note exists:",
+        "- Decisions made and their rationale",
+        "- Research conclusions with specific numbers/metrics",
+        "- Patterns discovered (what worked, what didn't)",
+        "- Configuration values that produced results",
+        "- Architectural or design insights",
+        "- Bugs root-caused and fixes applied",
+        "",
+        "IGNORE:",
+        "- Routine tool invocations (ls, grep, cat)",
+        "- Transient errors that were immediately fixed",
+        "- Todo items without resolution",
+        "- Chat pleasantries or process noise",
+        "- Status chatter, progress pings, and audit-continuity records",
+        "- No-op reviews or decisions that nothing needed changing",
+        "",
+        "Never produce audit-continuity notes, no-op review notes, or statements that nothing durable was found.",
+        "Return concise bullet points. If nothing durable was found, return exactly: NO_DURABLE_FINDINGS",
+      ].join("\n");
+
+      const input = JSON.stringify({
+        model: modelAuth.model,
+        auth: modelAuth.auth,
+        systemPrompt,
+        messageText: `Session event: ${reason}\n\n--- Session content ---\n${rawText.slice(0, 30000)}`,
+        timeoutMs: 15_000,
+      });
+
+      execFileAsync("bun", ["run", workerScript, "session-analysis", input], { cwd, timeout: 20_000, maxBuffer: 100_000 })
+        .then(({ stdout }) => {
+          try {
+            const result = JSON.parse(stdout.trim());
+            if (result.aborted || result.error || !result.text) return;
+            const findings = result.text;
+            if (findings && findings !== "NO_DURABLE_FINDINGS") {
+              const written = writeSessionFindings(cfg, cwd, reason, findings);
+              if (written) {
+                triggerObsidianDocumentIngest(cfg, cwd, written);
+                appendDocumentationJobLog(cfg, cwd, { kind: "session-findings", status: "written", trigger: reason, output: written, model: `${cfg.model.provider}/${cfg.model.id}` });
+                notify?.(`Archivist extracted session findings → journal`, "success");
+              }
+            }
+          } catch { /* background worker result parse failed silently */ }
+        })
+        .catch(() => { /* background worker failed silently */ });
+    }).catch(() => { /* model auth resolution failed silently */ });
+  }
 
   // Session compaction is a good low-interference point for Archivist:
   // preserve the compacted context and run documentation maintenance
@@ -1379,39 +1461,138 @@ export default function (pi: ExtensionAPI) {
     const runtime = { modelRegistry: ctx.modelRegistry, signal: ctx.signal };
     const notify = createSafeNotifier(ctx);
 
-    // Fire-and-forget model-based session analysis.
-    void (async () => {
-      const findings = await modelSessionAnalysis(runtime, cfg, { reason, rawText });
-      if (findings && findings !== "NO_DURABLE_FINDINGS") {
-        const written = writeSessionFindings(cfg, ctx.cwd, reason, findings);
-        if (written) {
-          triggerObsidianDocumentIngest(cfg, ctx.cwd, written);
-          appendDocumentationJobLog(cfg, ctx.cwd, { kind: "session-findings", status: "written", trigger: reason, output: written, model: `${cfg.model.provider}/${cfg.model.id}` });
-          notify?.(`Archivist extracted session findings → journal`, "success");
-        }
-      }
-    })().catch(() => { /* silently fail — session analysis is best-effort */ });
+    // Model-based session analysis runs in a background child process so
+    // Pi's TUI remains responsive during session lifecycle events.
+    runBackgroundSessionAnalysis(cfg, ctx.cwd, reason, rawText, ctx);
 
-    // Documentation drift audit.
+    // Documentation drift audit — already fire-and-forget but model calls
+    // still tie up the event loop. Delegate to background worker too.
     const cwdForDocsAudit = ctx.cwd;
     void (async () => {
-      const audit = await auditDocumentationDrift(state, cfg, cwdForDocsAudit, runtime);
-      if (!audit.needed) return;
-      notify?.(`Archivist ${reason} documentation maintenance started asynchronously`, "info");
-      const handled = await completeDocumentationDrift(runtime, cfg, cwdForDocsAudit, audit);
-      const applied = handled.applied?.length ? ` Updated: ${[...new Set(handled.applied)].join(", ")}` : "";
-      const suffix = handled.handled ? applied || " No repo-doc update needed." : " Handoff written to Archivist inbox.";
-      notify?.(`Archivist ${reason} documentation maintenance complete.${suffix}`, handled.handled ? "success" : "warning");
-      sendArchivistMessage(pi, {
-        customType: "archivist-doc-maintenance-complete",
-        content: documentationMaintenanceReport(handled),
-        display: true,
-        details: handled,
+      // Fast deterministic check first (git diff, fingerprint).
+      const files = await gitChangedFiles(cwdForDocsAudit).catch(() => [] as string[]);
+      if (!files.length) return;
+
+      const fingerprintDiff = await git(cwdForDocsAudit, ["diff", "--", ...[...files].sort()]).catch(() => "");
+      const persistentFingerprint = documentationAuditFingerprint(files, fingerprintDiff);
+      const hash = hashAutoMemory(`archivist-doc-audit\n${persistentFingerprint}`);
+      if (state?.autoMemory?.docAuditHashes?.includes(hash)) return;
+      if (hasSeenDocDriftAudit(cwdForDocsAudit, persistentFingerprint)) return;
+
+      // Model-dependent audit decision runs via background worker.
+      runBackgroundDocAudit(cfg, cwdForDocsAudit, runtime, reason, files, hash, persistentFingerprint, ctx, notify);
+    })().catch(() => { /* deterministics-only path failed silently */ });
+  }
+
+  /**
+   * Run documentation drift decision in a background child process.
+   */
+  function runBackgroundDocAudit(
+    cfg: ArchivistConfig,
+    cwd: string,
+    runtime: { modelRegistry: ExtensionContext["modelRegistry"]; signal: AbortSignal },
+    reason: string,
+    files: string[],
+    hash: string,
+    persistentFingerprint: string,
+    ctx: ExtensionContext,
+    notify: ReturnType<typeof createSafeNotifier>,
+  ) {
+    const workerScript = path.join(path.dirname(__filename), "..", "pi-sherpa", "scripts", "background-model-worker.ts");
+
+    resolveArchivistModelAuth(cfg, runtime).then((modelAuth) => {
+      if (!modelAuth) {
+        // heuristicOnly — mark as seen and return
+        rememberDocAuditHash(state, hash);
+        recordDocDriftAudit(cwd, persistentFingerprint, "skipped");
+        return;
+      }
+
+      const diff = git(cwd, ["diff", "--", ...files]).catch(() => "").then((diffOut) => {
+        const docSnippets = documentationAuditSnippets(cwd);
+        const auditPrompt = [
+          "You are an expert documentation auditor reviewing code changes.",
+          "",
+          "Determine if the following code changes need documentation updates.",
+          "",
+          `Changed files:\n${files.join("\n")}`,
+          `\nDiff excerpt:\n${diffOut.slice(0, 20000)}`,
+          docSnippets.length ? `\nExisting docs:\n${docSnippets.join("\n\n")}` : "\nNo existing documentation found.",
+          "",
+          `Return ONLY JSON: { "needsUpdate": boolean, "candidateDocs": string[], "reason": "why" }`,
+        ].join("\n");
+
+        const input = JSON.stringify({
+          model: modelAuth.model,
+          auth: modelAuth.auth,
+          systemPrompt: auditPrompt,
+          messageText: "Determine if documentation updates are needed.",
+          timeoutMs: 15_000,
+        });
+
+        execFileAsync("bun", ["run", workerScript, "session-analysis", input], { cwd, timeout: 20_000, maxBuffer: 100_000 })
+          .then(({ stdout }) => {
+            try {
+              const result = JSON.parse(stdout.trim());
+              if (result.aborted || result.error || !result.text) {
+                // Model unavailable — skip audit silently
+                rememberDocAuditHash(state, hash);
+                recordDocDriftAudit(cwd, persistentFingerprint, "no_update");
+                return;
+              }
+
+              // Try to parse the audit decision from the response
+              const auditResponse = parseDocumentationAuditResponse(result.text);
+              if (auditResponse && !auditResponse.needsUpdate) {
+                if (state) {
+                  rememberDocAuditHash(state, hash);
+                  recordDocDriftAudit(cwd, persistentFingerprint, "no_update");
+                }
+                return;
+              }
+
+              // Needs update — run the actual maintenance path
+              if (state) {
+                rememberDocAuditHash(state, hash);
+                recordDocDriftAudit(cwd, persistentFingerprint, "needs_update");
+              }
+
+              const candidates = safeExistingDocCandidates(cwd, auditResponse?.candidateDocs).slice(0, 8);
+              const audit = { needed: true, hash, changedSources: files, candidates };
+
+              notify?.(`Archivist ${reason} documentation maintenance started asynchronously`, "info");
+              completeDocumentationDrift(runtime, cfg, cwd, audit)
+                .then((handled) => {
+                  const applied = handled.applied?.length ? ` Updated: ${[...new Set(handled.applied)].join(", ")}` : "";
+                  const suffix = handled.handled ? applied || " No repo-doc update needed." : " Handoff written to Archivist inbox.";
+                  notify?.(`Archivist ${reason} documentation maintenance complete.${suffix}`, handled.handled ? "success" : "warning");
+                  sendArchivistMessage({
+                    customType: "archivist-doc-maintenance-complete",
+                    content: documentationMaintenanceReport(handled),
+                    display: true,
+                    details: handled,
+                  });
+                })
+                .catch((error) => {
+                  const message = error instanceof Error ? error.message : String(error);
+                  appendInboxNote(cfg, cwd, "Documentation drift async failure", `Archivist ${reason} asynchronous documentation maintenance failed.\n\n${message}`);
+                  notify?.(`Archivist ${reason} documentation maintenance failed: ${message}`, "error");
+                });
+            } catch {
+              rememberDocAuditHash(state, hash);
+              recordDocDriftAudit(cwd, persistentFingerprint, "no_update");
+            }
+          })
+          .catch(() => {
+            // Background worker unavailable — skip silently
+            rememberDocAuditHash(state, hash);
+            recordDocDriftAudit(cwd, persistentFingerprint, "no_update");
+          });
       });
-    })().catch((error) => {
-      const message = error instanceof Error ? error.message : String(error);
-      appendInboxNote(cfg, cwdForDocsAudit, "Documentation drift async failure", `Archivist ${reason} asynchronous documentation maintenance failed.\n\n${message}`);
-      notify?.(`Archivist ${reason} documentation maintenance failed: ${message}`, "error");
+    }).catch(() => {
+      // Model auth failed — skip silently
+      rememberDocAuditHash(state, hash);
+      recordDocDriftAudit(cwd, persistentFingerprint, "no_update");
     });
   }
 
@@ -1787,7 +1968,7 @@ export default function (pi: ExtensionAPI) {
           const applied = handled.applied?.length ? ` Updated: ${[...new Set(handled.applied)].join(", ")}` : "";
           const suffix = handled.handled ? applied || " No repo-doc update needed." : " Handoff written to Archivist inbox.";
           notify?.(`Archivist async documentation maintenance complete.${suffix}`, handled.handled ? "success" : "warning");
-          sendArchivistMessage(pi, {
+          sendArchivistMessage({
             customType: "archivist-doc-maintenance-complete",
             content: documentationMaintenanceReport(handled),
             display: true,
@@ -2160,6 +2341,6 @@ export default function (pi: ExtensionAPI) {
     appendJournalNote(cfg, ctx.cwd, "Archivist bootstrap", [summary, rowsAdded ? `\nCatalog rows added: ${rowsAdded}` : "\nNo new catalog rows added."].join(""));
     appendDocumentationJobLog(cfg, ctx.cwd, { kind: "bootstrap", status: "completed", trigger: "archivist:bootstrap", rowsAdded, summary: summary.slice(0, 800) });
     ctx.ui.notify([`Archivist bootstrap complete.`, rowsAdded ? `Rows added: ${rowsAdded}` : "No new catalog rows.", "", summary.slice(0, 800)].join("\n"), "success");
-    sendArchivistMessage(pi, { customType: "archivist-bootstrap-complete", content: summary, display: true });
+    sendArchivistMessage({ customType: "archivist-bootstrap-complete", content: summary, display: true });
   }});
 }
